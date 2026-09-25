@@ -10,7 +10,7 @@ After=network-online.target
 WorkingDirectory=%h/tg-bot3
 ExecStart=/usr/bin/env node src/main.ts %h/.local/share/tg-bot3/%i
 # pi and the tools agents use must be on PATH.
-Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=%h/.pi/agent/bin:%h/.local/bin:%h/.bun/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
 Restart=on-failure
 RestartSec=5s
 KillMode=control-group
