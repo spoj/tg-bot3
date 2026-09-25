@@ -17,6 +17,7 @@ export class Worker {
   private readonly pending = new Map<string, { resolve: () => void; reject: (error: Error) => void }>();
   private settledWaiters: Array<() => void> = [];
   private busy = false;
+  private dead = false;
   private stderr = "";
   private abortTimer: NodeJS.Timeout | undefined;
   private idleTimer: NodeJS.Timeout | undefined;
@@ -39,7 +40,7 @@ export class Worker {
       this.stderr += error.message;
     });
     this.exited = new Promise((resolve) => this.child.on("close", (code, signal) => {
-      clearTimeout(this.abortTimer);
+      this.dead = true;
       clearTimeout(this.idleTimer);
       const error = new Error(`pi exited (${code ?? signal}): ${this.stderr.trim()}`);
       for (const { reject } of this.pending.values()) reject(error);
@@ -57,7 +58,10 @@ export class Worker {
     try {
       await this.request({ type: "prompt", message, streamingBehavior: behavior });
     } catch (error) {
-      if (!wasBusy) this.settle();
+      if (!wasBusy) {
+        this.settle();
+        this.armIdle();
+      }
       throw error;
     }
     // A queued user message aborts a long-running turn so the agent picks it up promptly.
@@ -112,6 +116,7 @@ export class Worker {
       this.abortTimer = undefined;
     } else if (event.type === "agent_settled") {
       this.settle();
+      this.armIdle();
     }
   }
 
@@ -125,11 +130,11 @@ export class Worker {
     this.abortTimer = undefined;
     for (const resolve of this.settledWaiters) resolve();
     this.settledWaiters = [];
-    this.armIdle();
   }
 
   private armIdle(): void {
     clearTimeout(this.idleTimer);
+    if (this.dead) return;
     this.idleTimer = setTimeout(() => void this.close(), IDLE_MS);
   }
 }

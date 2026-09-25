@@ -1,0 +1,20 @@
+# systemd user unit: copy to ~/.config/systemd/user/, then
+#   systemctl --user enable --now tg-bot3
+# Add a second bot by copying with another state directory argument.
+[Unit]
+Description=tg-bot3 Telegram agent
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+WorkingDirectory=%h/tg-bot3
+ExecStart=/usr/bin/env node src/main.ts %h/.local/share/tg-bot3
+# pi and the tools agents use must be on PATH.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Restart=on-failure
+RestartSec=5s
+KillMode=control-group
+TimeoutStopSec=20s
+
+[Install]
+WantedBy=default.target
