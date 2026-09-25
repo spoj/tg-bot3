@@ -1,6 +1,6 @@
 # systemd user template: copy to ~/.config/systemd/user/, then
 #   systemctl --user enable --now tg-bot3@<name>
-# Instance <name> uses the state directory ~/.local/share/tg-bot3/<name>.
+# Instance <name> runs agents in ~/<name> with bot state in ~/<name>/bot.
 [Unit]
 Description=tg-bot3 Telegram agent (%i)
 Wants=network-online.target
@@ -8,7 +8,7 @@ After=network-online.target
 
 [Service]
 WorkingDirectory=%h/tg-bot3
-ExecStart=/usr/bin/env node src/main.ts %h/.local/share/tg-bot3/%i
+ExecStart=/usr/bin/env node src/main.ts %h/%i
 # pi and the tools agents use must be on PATH.
 Environment=PATH=%h/.pi/agent/bin:%h/.local/bin:%h/.bun/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
 Restart=on-failure
