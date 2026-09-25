@@ -1,0 +1,20 @@
+{
+  "name": "tg-bot3",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "start": "node src/main.ts",
+    "typecheck": "tsc",
+    "test": "node --test test/*.test.ts"
+  },
+  "dependencies": {
+    "grammy": "1.45.1"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.87.1",
+    "@types/node": "26.2.0",
+    "typebox": "1.3.7",
+    "typescript": "6.0.3"
+  }
+}
