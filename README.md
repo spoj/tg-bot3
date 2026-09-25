@@ -10,10 +10,10 @@ Requires Node.js 24+ and `pi` on `PATH`.
 
 ```sh
 pnpm install
-mkdir -p ~/.local/share/tg-bot3
-echo '{"token": "<BOT_TOKEN>", "cwd": "~"}' > ~/.local/share/tg-bot3/config.json
-echo '[<your chat id>]' > ~/.local/share/tg-bot3/allowed.json
-pnpm start            # or: node src/main.ts <state dir>
+mkdir -p -m700 ~/.local/share/tg-bot3/mybot
+echo '{"token": "<BOT_TOKEN>", "cwd": "~"}' > ~/.local/share/tg-bot3/mybot/config.json
+echo '[<your chat id>]' > ~/.local/share/tg-bot3/mybot/allowed.json
+node src/main.ts ~/.local/share/tg-bot3/mybot
 ```
 
 `config.json`:
@@ -25,7 +25,7 @@ pnpm start            # or: node src/main.ts <state dir>
 | `agentDir` | Pi's default (`~/.pi/agent`) | Sets `PI_CODING_AGENT_DIR` for agents |
 | `pi` | `pi` | Pi command |
 
-The state directory is the first argument, else `$TG_BOT_DIR`, else `~/.local/share/tg-bot3`. Run one process per bot. A systemd user unit is in `deploy/`.
+Run one process per bot, each with its own state directory. `deploy/tg-bot3@.service` is a systemd user template: `tg-bot3@mybot` uses `~/.local/share/tg-bot3/mybot`.
 
 Messages from chats that are not allowed are dropped; the first one per chat and process lifetime is recorded as `telegram.access_request`, so an agent can add the chat when you approve.
 

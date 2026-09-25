@@ -4,8 +4,7 @@
   "type": "module",
   "engines": { "node": ">=24" },
   "scripts": {
-    "start": "node src/main.ts",
-    "typecheck": "tsc",
+        "typecheck": "tsc",
     "test": "node --test test/*.test.ts"
   },
   "dependencies": {

@@ -11,7 +11,8 @@ import { conversationKey, Timeline, type Conversation } from "./timeline.ts";
 type Config = { token: string; cwd?: string; agentDir?: string; pi?: string };
 
 const expand = (value: string) => path.resolve(value.replace(/^~(?=\/|$)/, homedir()));
-const stateDir = expand(process.argv[2] ?? process.env.TG_BOT_DIR ?? "~/.local/share/tg-bot3");
+if (!process.argv[2]) throw new Error("usage: node src/main.ts <state dir>");
+const stateDir = expand(process.argv[2]);
 const config: Config = JSON.parse(readFileSync(path.join(stateDir, "config.json"), "utf8"));
 const cwd = expand(config.cwd ?? "~");
 const state = (name: string) => path.join(stateDir, name);
