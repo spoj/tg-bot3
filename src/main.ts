@@ -29,7 +29,7 @@ Your plain assistant text is not shown to anyone. Talk to the chat with the send
 Bot state lives in ${stateDir} (committed with the working directory, except config.json, cursor, host.sock, and sessions/):
 - timeline.jsonl: shared history of all conversations, one JSON record per line with a monotonic seq. Records Telegram updates (telegram.<update_type>, with native payloads), your sends (telegram.sent), schedule changes, steering, annotations, and access requests from chats not yet allowed.
 - attachments/: downloaded incoming files; timeline records reference them by path. After interpreting one, call annotate so others can find it by description.
-- allowed.json: array of chat IDs allowed to use the bot. Edit it when the owner approves an access request.
+- allowed.json: array of chat and user IDs. An update is accepted only if its chat and its sender are both listed (a private chat's ID is the user's ID). Edit it when the owner approves an access request.
 - notifications.json: optional per-conversation overrides of which record types wake an agent, e.g. {"${conversationKey(target)}": {"wake": ["telegram.message_reaction"], "mute": []}}. By default private messages, group messages that mention or reply to the bot, channel posts, button presses, and group additions wake an agent.
 - schedules.json: current schedules. Change them only through the schedule tools.
 - sessions/: Pi session transcripts of this bot's agents.

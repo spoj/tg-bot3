@@ -2,7 +2,7 @@
 
 Telegram front end for [Pi](https://github.com/earendil-works/pi). Each Telegram conversation (chat, or forum topic) gets its own `pi --mode rpc` process, started on demand in a working directory you choose with your normal Pi setup: settings, credentials, extensions, `AGENTS.md`. The bot keeps its state in `bot/` inside that directory. The host adds only its tools and a short runtime prompt.
 
-There is no sandbox. Agents run as your user with your permissions; only chats in `bot/allowed.json` can reach them.
+There is no sandbox. Agents run as your user with your permissions; only users in `bot/allowed.json`, in chats also listed there, can reach them.
 
 ## Setup
 
@@ -27,7 +27,7 @@ node src/main.ts ~/bothome
 
 Run one process per bot, each with its own working directory. `deploy/tg-bot3@.service` is a systemd user template: `tg-bot3@bothome` runs in `~/bothome`.
 
-Messages from chats that are not allowed are dropped; the first one per chat and process lifetime is recorded as `telegram.access_request`, so an agent can add the chat when you approve.
+`allowed.json` lists chat and user IDs; an update is accepted only if its chat and its sender are both listed (a private chat's ID is the user's ID). In an allowed group, members who are not listed are ignored. Other updates are dropped; the first per chat, sender, and process lifetime is recorded as `telegram.access_request` with IDs and username only, so an agent can add them when you approve.
 
 ## How it works
 

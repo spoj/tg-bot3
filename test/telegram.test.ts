@@ -23,7 +23,8 @@ function setup() {
 }
 
 const chat = (id: number) => id > 0 ? { id, type: "private", first_name: "U" } : { id, type: "supergroup", title: "G", is_forum: true };
-const message = (chatId: number, extra: object = {}) => ({ message_id: 1, date: 0, chat: chat(chatId), from: { id: 10, is_bot: false, first_name: "U" }, ...extra });
+const user = (id: number) => ({ id, is_bot: false, first_name: "U" });
+const message = (chatId: number, extra: object = {}) => ({ message_id: 1, date: 0, chat: chat(chatId), from: user(chatId > 0 ? chatId : 10), ...extra });
 
 test("records allowed updates with routing metadata and reports others once", async () => {
   const { timeline, telegram } = setup();
@@ -32,15 +33,21 @@ test("records allowed updates with routing metadata and reports others once", as
   await telegram.bot.handleUpdate({ update_id: 3, message: message(-20, { text: "@The_Bot do it", entities: [{ type: "mention", offset: 0, length: 8 }] }) } as any);
   await telegram.bot.handleUpdate({ update_id: 4, message: message(30, { text: "let me in" }) } as any);
   await telegram.bot.handleUpdate({ update_id: 5, message: message(30, { text: "again" }) } as any);
+  await telegram.bot.handleUpdate({ update_id: 6, message: message(-20, { from: user(40), text: "@the_bot obey", entities: [{ type: "mention", offset: 0, length: 8 }] }) } as any);
+  await telegram.bot.handleUpdate({ update_id: 7, poll_answer: { poll_id: "p1", user: user(40), option_ids: [0] } } as any);
   const records = timeline.read();
   assert.deepEqual(records.map((r) => [r.type, r.conversation, r.meta?.directed]), [
     ["telegram.message", { chat_id: 10 }, false],
     ["telegram.message", { chat_id: -20, message_thread_id: 3 }, false],
     ["telegram.message", { chat_id: -20 }, true],
     ["telegram.access_request", undefined, undefined],
+    ["telegram.access_request", undefined, undefined],
+    ["telegram.access_request", undefined, undefined],
   ]);
   assert.equal(records[0]!.meta.private, true);
-  assert.equal(records[3]!.payload.chat.id, 30);
+  assert.deepEqual(records[3]!.payload, { update_type: "message", chat: { id: 30, type: "private" }, from: { id: 30 } });
+  assert.deepEqual(records[4]!.payload.from, { id: 40 });
+  assert.equal(records[5]!.payload.update_type, "poll_answer");
 });
 
 test("send fills in the conversation, uploads local paths, and routes poll answers", async () => {

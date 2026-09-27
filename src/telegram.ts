@@ -69,17 +69,23 @@ export class Telegram {
     // grammY's default agent bypasses Node's environment proxy support.
     const bot = new Bot(token, { client: { baseFetchConfig: { agent: globalAgent } } });
     this.bot = bot;
-    const reported = new Set<number>();
+    const reported = new Set<string>();
 
+    // Both the chat and the sender must be allowed; names and titles of others are free text, so they are not recorded.
     bot.use(async (ctx, next) => {
-      if (!ctx.chat) return next();
       const allowed: number[] = existsSync(allowedPath) ? JSON.parse(readFileSync(allowedPath, "utf8")) : [];
-      if (allowed.includes(ctx.chat.id)) return next();
-      if (reported.has(ctx.chat.id)) return;
-      reported.add(ctx.chat.id);
+      const sender = ctx.from ?? ctx.pollAnswer?.user ?? ctx.senderChat;
+      if (sender && allowed.includes(sender.id) && (!ctx.chat || allowed.includes(ctx.chat.id))) return next();
+      const key = `${ctx.chat?.id}:${sender?.id}`;
+      if (reported.has(key)) return;
+      reported.add(key);
       timeline.publish({
         type: "telegram.access_request",
-        payload: { update_type: updateType(ctx), chat: ctx.chat, from: ctx.from },
+        payload: {
+          update_type: updateType(ctx),
+          chat: ctx.chat && { id: ctx.chat.id, type: ctx.chat.type },
+          from: sender && { id: sender.id, username: sender.username },
+        },
       });
     });
 
