@@ -7,12 +7,11 @@ const USER_STEER_ABORT_MS = 2 * 60_000;
 type Overrides = { wake?: string[]; mute?: string[] };
 
 export function wakes(record: TimelineRecord, overrides: Overrides = {}): boolean {
-  if (overrides.mute?.includes(record.type)) return false;
-  if (overrides.wake?.includes(record.type)) return true;
   const meta = record.meta ?? {};
+  if (!meta.allowed_sender || overrides.mute?.includes(record.type)) return false;
+  if (overrides.wake?.includes(record.type)) return true;
   switch (record.type) {
     case "telegram.message": return meta.user_content && (meta.private || meta.directed);
-    case "telegram.channel_post": return meta.user_content;
     case "telegram.callback_query": return true;
     case "telegram.my_chat_member": return meta.group_add;
     default: return false;

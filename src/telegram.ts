@@ -69,27 +69,36 @@ export class Telegram {
     // grammY's default agent bypasses Node's environment proxy support.
     const bot = new Bot(token, { client: { baseFetchConfig: { agent: globalAgent } } });
     this.bot = bot;
-    const reported = new Set<string>();
+    const reported = new Set<number | undefined>();
+    const allowedIds = (): number[] => existsSync(allowedPath) ? JSON.parse(readFileSync(allowedPath, "utf8")) : [];
+    const sender = (ctx: Context) => ctx.from ?? ctx.pollAnswer?.user;
+    const allowedSender = (ctx: Context) => allowedIds().some((id) => id === sender(ctx)?.id);
 
-    // Both the chat and the sender must be allowed; names and titles of others are free text, so they are not recorded.
+    // A private chat needs an allowed user. A group or channel needs to be allowed and to have an allowed admin;
+    // then all of its updates are recorded. Names and titles of others are free text, so access requests omit them.
     bot.use(async (ctx, next) => {
-      const allowed: number[] = existsSync(allowedPath) ? JSON.parse(readFileSync(allowedPath, "utf8")) : [];
-      const sender = ctx.from ?? ctx.pollAnswer?.user ?? ctx.senderChat;
-      if (sender && allowed.includes(sender.id) && (!ctx.chat || allowed.includes(ctx.chat.id))) return next();
-      const key = `${ctx.chat?.id}:${sender?.id}`;
+      const ids = allowedIds();
+      const chat = ctx.chat;
+      const accepted = !chat ? allowedSender(ctx)
+        : chat.type === "private" ? ids.includes(chat.id)
+        : ids.includes(chat.id) && (await bot.api.getChatAdministrators(chat.id)).some((admin) => ids.includes(admin.user.id));
+      if (accepted) return next();
+      const user = sender(ctx);
+      const key = chat?.id ?? user?.id;
       if (reported.has(key)) return;
       reported.add(key);
       timeline.publish({
         type: "telegram.access_request",
         payload: {
           update_type: updateType(ctx),
-          chat: ctx.chat && { id: ctx.chat.id, type: ctx.chat.type },
-          from: sender && { id: sender.id, username: sender.username },
+          chat: chat && { id: chat.id, type: chat.type },
+          from: user && { id: user.id, username: user.username },
         },
       });
     });
 
-    bot.command("restart", async (ctx) => {
+    bot.command("restart", async (ctx, next) => {
+      if (!allowedSender(ctx)) return next();
       onRestart();
       await ctx.reply("Restarting agents; each starts a fresh session on its next message.");
     });
@@ -99,19 +108,18 @@ export class Telegram {
       const payload = (ctx.update as Record<string, any>)[type];
       const target = this.conversationOf(ctx, type, payload);
       if (!target) return;
-      const event: TimelineEvent = { type: `telegram.${type}`, conversation: target, payload };
+      const meta: Record<string, boolean> = { allowed_sender: allowedSender(ctx) };
+      const event: TimelineEvent = { type: `telegram.${type}`, conversation: target, payload, meta };
       const message = ctx.msg;
       if (MESSAGE_UPDATES.has(type) && message) {
         event.attachments = await download(bot, token, attachmentsDir, message);
-        event.meta = {
-          private: message.chat.type === "private",
-          directed: isDirected(message, bot.botInfo),
-          user_content: !SERVICE_FIELDS.some((field) => field in message),
-        };
+        meta.private = message.chat.type === "private";
+        meta.directed = isDirected(message, bot.botInfo);
+        meta.user_content = !SERVICE_FIELDS.some((field) => field in message);
       }
       if (type === "my_chat_member") {
         const { old_chat_member: before, new_chat_member: after } = payload;
-        event.meta = { group_add: ["member", "administrator"].includes(after.status) && ["left", "kicked"].includes(before.status) };
+        meta.group_add = ["member", "administrator"].includes(after.status) && ["left", "kicked"].includes(before.status);
       }
       if (type === "callback_query") void ctx.answerCallbackQuery().catch(() => {});
       timeline.publish(event);

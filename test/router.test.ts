@@ -8,7 +8,7 @@ import type { Agents } from "../src/agents.ts";
 import { Router, wakes } from "../src/router.ts";
 import type { TimelineRecord } from "../src/timeline.ts";
 
-const record = (seq: number, type: string, meta?: object): TimelineRecord => ({ seq, t: "", type, conversation: { chat_id: 5 }, ...(meta && { meta }) });
+const record = (seq: number, type: string, meta?: object): TimelineRecord => ({ seq, t: "", type, conversation: { chat_id: 5 }, meta: { allowed_sender: true, ...meta } });
 
 test("default attention and per-conversation overrides", () => {
   assert.equal(wakes(record(1, "telegram.message", { user_content: true, private: true })), true);
@@ -18,6 +18,8 @@ test("default attention and per-conversation overrides", () => {
   assert.equal(wakes(record(1, "telegram.message_reaction")), false);
   assert.equal(wakes(record(1, "telegram.message_reaction"), { wake: ["telegram.message_reaction"] }), true);
   assert.equal(wakes(record(1, "telegram.callback_query"), { mute: ["telegram.callback_query"] }), false);
+  assert.equal(wakes(record(1, "telegram.message", { user_content: true, directed: true, allowed_sender: false })), false);
+  assert.equal(wakes(record(1, "telegram.message", { allowed_sender: false }), { wake: ["telegram.message"] }), false);
 });
 
 test("cursor waits for in-flight deliveries and skips replayed records", async () => {
