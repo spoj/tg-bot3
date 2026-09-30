@@ -1,6 +1,6 @@
 # tg-bot3
 
-Telegram front end for [Pi](https://github.com/earendil-works/pi). Each Telegram conversation (chat, or forum topic) gets its own `pi --mode rpc` process, started on demand in a working directory you choose with your normal Pi setup: settings, credentials, extensions, `AGENTS.md`. The bot keeps its state in `bot/` inside that directory. The host adds only its tools and a short runtime prompt.
+Telegram front end for [Pi](https://github.com/earendil-works/pi). Each Telegram conversation (chat, or forum topic) gets its own `pi --mode rpc` process, started on demand in a working directory you choose with your normal Pi setup: settings, credentials, extensions, `AGENTS.md`. The bot keeps its state in `bot/` inside a separate bot home directory. The host adds its tools, a short runtime prompt, and any instruction files configured for this bot.
 
 There is no sandbox. Agents run as your user with your permissions; only users in `bot/allowed.json` can wake them.
 
@@ -11,7 +11,8 @@ Requires Node.js 24+ and `pi` on `PATH`.
 ```sh
 pnpm install
 mkdir -p -m700 ~/bothome/bot
-echo '{"token": "<BOT_TOKEN>"}' > ~/bothome/bot/config.json
+echo '{"token": "<BOT_TOKEN>", "cwd": "~"}' > ~/bothome/bot/config.json
+chmod 600 ~/bothome/bot/config.json
 echo '[<your chat id>]' > ~/bothome/bot/allowed.json
 printf 'bot/config.json\nbot/cursor\nbot/host.sock\nbot/sessions/\n' >> ~/bothome/.gitignore   # if it is a Git repo
 node src/main.ts ~/bothome
@@ -22,10 +23,14 @@ node src/main.ts ~/bothome
 | Key | Default | Meaning |
 |---|---|---|
 | `token` | required | Bot token |
+| `cwd` | required | Agent working directory, independent of bot state |
+| `instructions` | `[]` | Instruction files appended with `--append-system-prompt` |
 | `agentDir` | Pi's default (`~/.pi/agent`) | Sets `PI_CODING_AGENT_DIR` for agents |
 | `pi` | `pi` | Pi command |
 
-Run one process per bot, each with its own working directory. `deploy/tg-bot3@.service` is a systemd user template: `tg-bot3@bothome` runs in `~/bothome`.
+`cwd`, `instructions`, and `agentDir` paths resolve relative to the bot home directory; absolute paths and `~` are supported. Pi still loads its normal context files from the agent directory, the working directory, and its parents. Configured instruction files load in addition to those; do not list files that Pi already discovers. For example, create `~/bothome/AGENTS.md` for shared rules and `~/bothome/bot/AGENTS.md` for Telegram-only rules, then set `"instructions": ["AGENTS.md", "bot/AGENTS.md"]`.
+
+Run one process per bot, each with its own bot home directory. Bots may share an agent working directory. `deploy/tg-bot3@.service` is a systemd user template: `tg-bot3@bothome` reads `~/bothome/bot/config.json` and keeps state in `~/bothome/bot/`; agents run in its configured `cwd`.
 
 `allowed.json` lists user and chat IDs. Private chats of listed users are recorded. A listed group or channel is recorded in full only while a listed user is one of its admins (checked on every update); otherwise it is ignored. Records carry `meta.allowed_sender`, and only records from listed users can wake an agent. Other updates are dropped; the first per chat (or chatless sender) and process lifetime is recorded as `telegram.access_request` with IDs and username only, so an agent can add them when you approve.
 

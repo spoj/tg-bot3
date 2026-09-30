@@ -1,6 +1,6 @@
 # systemd user template: copy to ~/.config/systemd/user/, then
 #   systemctl --user enable --now tg-bot3@<name>
-# Instance <name> runs agents in ~/<name> with bot state in ~/<name>/bot.
+# Instance <name> uses ~/<name>/bot; config.json sets the agents' working directory.
 [Unit]
 Description=tg-bot3 Telegram agent (%i)
 Wants=network-online.target
