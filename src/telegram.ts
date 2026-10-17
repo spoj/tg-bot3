@@ -62,7 +62,6 @@ function localFile(value: unknown): unknown {
 export class Telegram {
   readonly bot: Bot;
   private readonly timeline: Timeline;
-  private readonly implicitTopics = new Map<number, { thread: number; next: number }>();
 
   constructor(options: TelegramOptions) {
     const { token, timeline, allowedPath, attachmentsDir, onRestart } = options;
@@ -168,17 +167,7 @@ export class Telegram {
         && (record.payload?.message_id ?? record.response?.message_id) === payload.message_id)?.conversation
         ?? conversation(chatId);
     }
-    const message = ctx.msg;
-    // A message sent outside any topic of a private chat makes Telegram create a topic with an implicit name,
-    // but the message itself may arrive without that topic; answer it there.
-    if (message?.chat.type === "private" && message.forum_topic_created?.is_name_implicit) {
-      this.implicitTopics.set(chatId, { thread: message.message_thread_id!, next: message.message_id + 1 });
-    } else if (message && !message.is_topic_message && this.implicitTopics.get(chatId)?.next === message.message_id) {
-      const { thread } = this.implicitTopics.get(chatId)!;
-      this.implicitTopics.delete(chatId);
-      return conversation(chatId, thread);
-    }
-    return conversation(chatId, message?.is_topic_message ? message.message_thread_id : undefined);
+    return conversation(chatId, ctx.msg?.is_topic_message ? ctx.msg.message_thread_id : undefined);
   }
 }
 
