@@ -1,6 +1,6 @@
 # tg-bot3
 
-Telegram front end for [Pi](https://github.com/earendil-works/pi). Each Telegram conversation (chat, or forum topic) gets its own `pi --mode rpc` process, started on demand in a working directory you choose with your normal Pi setup: settings, credentials, extensions, `AGENTS.md`. The bot keeps everything it owns in its state directory. The host adds its tools, a short runtime prompt, and the bot's own `AGENTS.md`.
+Telegram front end for [Pi](https://github.com/earendil-works/pi). Each Telegram conversation (chat, or forum topic, including the topic Telegram creates for a new private message) gets its own `pi --mode rpc` process, started on demand in a working directory you choose with your normal Pi setup: settings, credentials, extensions, `AGENTS.md`. The bot keeps everything it owns in its state directory. The host adds its tools, a short runtime prompt, and the bot's own `AGENTS.md`.
 
 There is no sandbox. Agents run as your user with your permissions; only users in `allowed.json` can wake them.
 

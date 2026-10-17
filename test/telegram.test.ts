@@ -56,6 +56,19 @@ test("records private chats of allowed users and all of allowed groups with an a
   assert.deepEqual(records.slice(6).map((r) => r.payload.chat.id), [-21, -22]);
 });
 
+test("a private message delivered outside the topic Telegram just created for it belongs to that topic", async () => {
+  const { timeline, telegram } = setup();
+  const created = { forum_topic_created: { name: "Hey", icon_color: 0, is_name_implicit: true }, message_thread_id: 7, is_topic_message: true };
+  await telegram.bot.handleUpdate({ update_id: 1, message: message(10, { message_id: 5, ...created }) } as any);
+  await telegram.bot.handleUpdate({ update_id: 2, message: message(10, { message_id: 6, text: "Hey" }) } as any);
+  await telegram.bot.handleUpdate({ update_id: 3, message: message(10, { message_id: 7, text: "reply in All" }) } as any);
+  assert.deepEqual(timeline.read().map((r) => r.conversation), [
+    { chat_id: 10, message_thread_id: 7 },
+    { chat_id: 10, message_thread_id: 7 },
+    { chat_id: 10 },
+  ]);
+});
+
 test("send fills in the conversation, uploads local paths, and routes poll answers", async () => {
   const { dir, timeline, telegram, calls } = setup();
   const file = path.join(dir, "a.txt");
