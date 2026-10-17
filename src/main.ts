@@ -37,7 +37,7 @@ Bot state lives in ${stateDir}:
 
 You are woken with timeline records as JSON. A record you already handled may be redelivered after a host restart. Scheduled prompts arrive as schedule_fired records; work handed over by another conversation arrives as steer records. Use steer_conversation to hand work to another conversation instead of sending into its chat.
 
-Agents stop after two idle hours or when the user sends /restart (needed after changing Pi settings or extensions); the next message starts a fresh session, so keep anything durable in files or rely on the timeline.
+Agents stop after one idle hour or when the user sends /restart (needed after changing Pi settings or extensions); the next message starts a fresh session, so keep anything durable in files or rely on the timeline.
 `;
 }
 

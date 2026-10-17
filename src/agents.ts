@@ -6,7 +6,7 @@ import { conversationKey, type Conversation } from "./timeline.ts";
 export type Behavior = "steer" | "followUp";
 export type WorkerOptions = { command: string; args: string[]; cwd: string; env: NodeJS.ProcessEnv };
 
-const IDLE_MS = 2 * 60 * 60_000;
+const IDLE_MS = 60 * 60_000;
 const KILL_GRACE_MS = 10_000;
 const RESTART_SETTLE_MS = 30_000;
 

@@ -45,7 +45,7 @@ Files named below are in the state directory.
 - **Steering**: a user message arriving while the agent is busy is queued as a Pi steer; if the agent has not picked it up within two minutes, the current operation is aborted so it does. Scheduled prompts are queued as follow-ups.
 - **Host tools** (`extensions/host-tools.ts`, loaded with `-e`): `send` (raw Bot API call into the agent's own conversation; local file paths upload), `annotate`, `steer_conversation`, and `schedule_add|replace|remove|take`. They reach the host over `host.sock`.
 - **Schedules** (`schedules.json`): hourly, daily, weekly, or one-off; due schedules wake their owning conversation.
-- **Lifecycle**: agents exit after two idle hours; `/restart` restarts all of them once their current work settles. A new process starts a fresh Pi session in `sessions/`, named `telegram <chat_id>:<thread_id>`.
+- **Lifecycle**: agents exit after one idle hour; `/restart` restarts all of them once their current work settles. A new process starts a fresh Pi session in `sessions/`, named `telegram <chat_id>:<thread_id>`.
 
 ## Checks
 
