@@ -10,12 +10,21 @@ function fakeWorker(): { worker: Worker; commands: () => any[] } {
   return { worker, commands: () => log.split("\n").filter(Boolean).map((line) => JSON.parse(line)) };
 }
 
-test("queued user steer aborts a busy turn after the deadline", async () => {
+test("user steer still queued at the deadline aborts the run and is prompted again, keeping follow-ups", async () => {
   const { worker, commands } = fakeWorker();
   await worker.prompt("long", "steer", 50);
   await worker.prompt("next", "steer", 50);
-  await worker.waitSettled();
-  assert.deepEqual(commands().map((command) => command.type), ["prompt", "prompt", "abort"]);
+  await worker.prompt("later", "followUp");
+  await sleep(200);
+  assert.deepEqual(commands().map(({ type, message, streamingBehavior }) => [type, message, streamingBehavior]), [
+    ["prompt", "long", "steer"],
+    ["prompt", "next", "steer"],
+    ["prompt", "later", "followUp"],
+    ["clear_queue", undefined, undefined],
+    ["abort", undefined, undefined],
+    ["prompt", "next", "steer"],
+    ["prompt", "later", "followUp"],
+  ]);
   await worker.close();
 });
 

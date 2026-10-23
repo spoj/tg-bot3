@@ -14,7 +14,7 @@ const RESTART_SETTLE_MS = 30_000;
 export class Worker {
   readonly exited: Promise<void>;
   private readonly child: ChildProcessWithoutNullStreams;
-  private readonly pending = new Map<string, { resolve: () => void; reject: (error: Error) => void }>();
+  private readonly pending = new Map<string, { resolve: (data: any) => void; reject: (error: Error) => void }>();
   private settledWaiters: Array<() => void> = [];
   private busy = false;
   private dead = false;
@@ -64,13 +64,27 @@ export class Worker {
       }
       throw error;
     }
-    // A queued user message aborts a long-running turn so the agent picks it up promptly.
+    // A queued user message interrupts a long-running turn so the agent picks it up promptly.
     if (wasBusy && abortAfterMs !== undefined) {
       this.abortTimer ??= setTimeout(() => {
         this.abortTimer = undefined;
-        this.request({ type: "abort" }).catch(() => {});
+        this.interrupt().catch((error) => console.error("Interrupting pi failed", error));
       }, abortAfterMs);
     }
+  }
+
+  /**
+   * Aborts the run and prompts with its queued steers. They leave the queue first: an aborted run would take
+   * them into the session and end without answering.
+   */
+  private async interrupt(): Promise<void> {
+    const { steering, followUp } = await this.request({ type: "clear_queue" });
+    // Pi may have taken the steers just before the deadline.
+    if (steering.length > 0) {
+      await this.request({ type: "abort" });
+      await this.prompt(steering.join("\n\n"), "steer");
+    }
+    for (const message of followUp) await this.prompt(message, "followUp");
   }
 
   waitSettled(): Promise<void> {
@@ -87,7 +101,7 @@ export class Worker {
     return this.exited.finally(() => clearTimeout(timer));
   }
 
-  private request(command: Record<string, unknown>): Promise<void> {
+  private request(command: Record<string, unknown>): Promise<any> {
     const id = randomUUID();
     return new Promise((resolve, reject) => {
       this.pending.set(id, { resolve, reject });
@@ -105,7 +119,7 @@ export class Worker {
     if (event.type === "response") {
       const pending = this.pending.get(event.id);
       this.pending.delete(event.id);
-      if (event.success) pending?.resolve();
+      if (event.success) pending?.resolve(event.data);
       else pending?.reject(new Error(event.error ?? "pi RPC request failed"));
     } else if (event.type === "extension_ui_request") {
       // Nobody can answer dialogs; decline them instead of blocking the agent.
