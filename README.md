@@ -41,7 +41,7 @@ Run one process per bot, each with its own state directory. Bots may share an ag
 Files named below are in the state directory.
 
 - **Timeline** (`timeline.jsonl`): every Telegram update, send, schedule change, steer, and annotation, one JSON record per line with a monotonic `seq`. Agents read it as shared memory. Incoming files go to `attachments/<chat>/<message>/`.
-- **Waking**: from listed users, private messages, group messages that mention or reply to the bot, button presses, and group additions are delivered to the conversation's agent as the raw record. `notifications.json` overrides this per conversation, still only for listed users: `{"<chat_id>:<thread_id>": {"wake": [types], "mute": [types]}}`. Deliveries are tracked by `cursor`; undelivered records replay after a restart.
+- **Waking**: from listed users, private messages, group messages that mention or reply to the bot, button presses, and group additions are delivered to the conversation's agent as the raw record. Deliveries are tracked by `cursor`; undelivered records replay after a restart.
 - **Steering**: a user message arriving while the agent is busy is queued as a Pi steer; if the agent has not picked it up within two minutes, the host takes the queued messages back, aborts the run, and prompts with them. Scheduled prompts are queued as follow-ups.
 - **Host tools** (`extensions/host-tools.ts`, loaded with `-e`): `send` (raw Bot API call into the agent's own conversation; local file paths upload), `annotate`, `steer_conversation`, and `schedule_add|replace|remove|take`. They reach the host over `host.sock`.
 - **Schedules** (`schedules.json`): hourly, daily, weekly, or one-off; due schedules wake their owning conversation.

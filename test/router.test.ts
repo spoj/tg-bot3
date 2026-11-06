@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -10,16 +10,13 @@ import type { TimelineRecord } from "../src/timeline.ts";
 
 const record = (seq: number, type: string, meta?: object): TimelineRecord => ({ seq, t: "", type, conversation: { chat_id: 5 }, meta: { allowed_sender: true, ...meta } });
 
-test("default attention and per-conversation overrides", () => {
+test("waking rules", () => {
   assert.equal(wakes(record(1, "telegram.message", { user_content: true, private: true })), true);
   assert.equal(wakes(record(1, "telegram.message", { user_content: true, private: false, directed: false })), false);
   assert.equal(wakes(record(1, "telegram.message", { user_content: false, private: true })), false);
   assert.equal(wakes(record(1, "telegram.callback_query")), true);
   assert.equal(wakes(record(1, "telegram.message_reaction")), false);
-  assert.equal(wakes(record(1, "telegram.message_reaction"), { wake: ["telegram.message_reaction"] }), true);
-  assert.equal(wakes(record(1, "telegram.callback_query"), { mute: ["telegram.callback_query"] }), false);
   assert.equal(wakes(record(1, "telegram.message", { user_content: true, directed: true, allowed_sender: false })), false);
-  assert.equal(wakes(record(1, "telegram.message", { allowed_sender: false }), { wake: ["telegram.message"] }), false);
 });
 
 test("cursor waits for in-flight deliveries and skips replayed records", async () => {
@@ -28,10 +25,10 @@ test("cursor waits for in-flight deliveries and skips replayed records", async (
   const agents = {
     deliver: (_target: unknown, message: string, behavior: string) => new Promise<void>((release) => deliveries.push({ message, behavior, release })),
   } as unknown as Agents;
-  writeFileSync(path.join(dir, "notifications.json"), JSON.stringify({ "5:0": { wake: ["telegram.edited_message"] } }));
-  const router = new Router({ cursorPath: path.join(dir, "cursor"), notificationsPath: path.join(dir, "notifications.json"), initialCursor: 0, agents, onError: () => {} });
+  const router = new Router({ cursorPath: path.join(dir, "cursor"), initialCursor: 0, agents, onError: () => {} });
+  const message = record(2, "telegram.message", { user_content: true, private: true });
   router.handle(record(1, "schedule_fired"));
-  router.handle(record(2, "telegram.edited_message"));
+  router.handle(message);
   router.handle(record(3, "telegram.message_reaction"));
   assert.deepEqual(deliveries.map((d) => d.behavior), ["followUp", "steer"]);
   deliveries[1]!.release();
@@ -40,6 +37,6 @@ test("cursor waits for in-flight deliveries and skips replayed records", async (
   deliveries[0]!.release();
   await sleep(0);
   assert.equal(readFileSync(path.join(dir, "cursor"), "utf8"), "3");
-  router.handle(record(2, "telegram.edited_message"));
+  router.handle(message);
   assert.equal(deliveries.length, 2);
 });
