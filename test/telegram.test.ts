@@ -3,7 +3,8 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { InputFile } from "grammy";
+import { format } from "node:util";
+import { BotError, Context, HttpError, InputFile } from "grammy";
 import { Telegram } from "../src/telegram.ts";
 import { Timeline } from "../src/timeline.ts";
 
@@ -71,6 +72,22 @@ test("send fills in the conversation, uploads local paths, and routes poll answe
   const answer = timeline.read().at(-1)!;
   assert.equal(answer.type, "telegram.poll_answer");
   assert.deepEqual(answer.conversation, target);
+});
+
+test("update failures are logged without the token", async () => {
+  const { telegram } = setup();
+  const ctx = new Context({ update_id: 1 } as any, telegram.bot.api, telegram.bot.botInfo);
+  const cause = new HttpError("Network request for 'getChatAdministrators' failed!", new Error("request to https://api.telegram.org/bot1:x/getChatAdministrators failed"));
+  const logged: string[] = [];
+  const log = console.error;
+  console.error = (...args: unknown[]) => logged.push(format(...args));
+  try {
+    await telegram.bot.errorHandler(new BotError(cause, ctx));
+  } finally {
+    console.error = log;
+  }
+  assert.match(logged.join("\n"), /Network request for 'getChatAdministrators' failed!/);
+  assert.doesNotMatch(logged.join("\n"), /1:x/);
 });
 
 test("/restart restarts agents without recording", async () => {

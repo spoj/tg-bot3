@@ -104,14 +104,18 @@ timeline.subscribe((record) => router.handle(record));
 for (const record of timeline.read()) router.handle(record);
 scheduler.start();
 
+// grammY errors print the token in request URLs and API objects, so only their stacks are logged.
 async function shutdown(): Promise<void> {
   scheduler.stop();
   server.close();
-  await telegram.bot.stop();
+  await telegram.bot.stop().catch((error: Error) => console.error("Stopping Telegram polling failed", error.stack));
   await agents.closeAll();
   process.exit(0);
 }
 process.once("SIGINT", shutdown);
 process.once("SIGTERM", shutdown);
 
-await telegram.run();
+await telegram.run().catch((error: Error) => {
+  console.error("Telegram polling failed", error.stack);
+  process.exit(1);
+});

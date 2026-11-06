@@ -125,7 +125,8 @@ export class Telegram {
       timeline.publish(event);
     });
 
-    bot.catch((error) => console.error("Telegram update failed", error));
+    // The BotError holds the context, whose API object prints the token; a network error's cause prints it in the URL.
+    bot.catch((error) => console.error("Telegram update failed", (error.error as Error).stack));
   }
 
   async run(): Promise<void> {

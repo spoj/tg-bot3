@@ -3,8 +3,6 @@
 # Instance <name> keeps its state in ~/<name>/bot; config.json there sets the agents' working directory.
 [Unit]
 Description=tg-bot3 Telegram agent (%i)
-Wants=network-online.target
-After=network-online.target
 
 [Service]
 WorkingDirectory=%h/tg-bot3
