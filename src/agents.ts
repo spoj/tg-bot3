@@ -30,6 +30,7 @@ export class Worker {
   private settledWaiters: Array<() => void> = [];
   private running = false;
   private prompting = 0;
+  private runError: string | undefined;
   private dead = false;
   private stderr = "";
   private abortTimer: NodeJS.Timeout | undefined;
@@ -157,7 +158,12 @@ export class Worker {
     } else if (event.type === "queue_update" && event.steering?.length === 0) {
       clearTimeout(this.abortTimer);
       this.abortTimer = undefined;
+    } else if (event.type === "agent_end" && !event.willRetry && event.messages.at(-1)?.stopReason === "error") {
+      this.runError = event.messages.at(-1).errorMessage;
     } else if (event.type === "agent_settled") {
+      // An abort can also end a run in an error; only failures nobody asked for are reported.
+      if (this.runError !== undefined && !event.aborted) this.events.onError(new Error(this.runError));
+      this.runError = undefined;
       this.running = false;
       if (!this.busy) this.settle(event.aborted);
     }

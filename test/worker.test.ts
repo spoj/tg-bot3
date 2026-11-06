@@ -49,6 +49,14 @@ test("settled worker does not abort, declines dialogs, and reports rejected prom
   await worker.close();
 });
 
+test("a run that fails is reported", async () => {
+  const { worker, events } = fakeWorker();
+  await worker.prompt("error", "steer");
+  await sleep(50);
+  assert.deepEqual(events, [["busy"], ["error", "Overloaded"], ["settled", false]]);
+  await worker.close();
+});
+
 test("a run that starts just after the previous one settled stays busy and gets no steer deadline", async () => {
   const { worker, events, commands } = fakeWorker();
   await worker.prompt("long", "steer");
