@@ -17,7 +17,7 @@ echo '[<your chat id>]' > ~/notes/bot/allowed.json
 node src/main.ts ~/notes/bot
 ```
 
-If the state directory is in a Git repo, ignore `config.json`, `cursor`, `host.sock`, and `sessions/` there.
+If the state directory is in a Git repo, ignore `config.json`, `busy.json`, `host.sock`, `*.tmp`, and `sessions/` there.
 
 `config.json`:
 
@@ -41,11 +41,11 @@ Run one process per bot, each with its own state directory. Bots may share an ag
 Files named below are in the state directory.
 
 - **Timeline** (`timeline.jsonl`): every Telegram update, send, schedule change, steer, and annotation, one JSON record per line with a monotonic `seq`. Agents read it as shared memory. Incoming files go to `attachments/<chat>/<message>/`.
-- **Waking**: from listed users, private messages, group messages that mention or reply to the bot, button presses, and group additions are delivered to the conversation's agent as the raw record. Deliveries are tracked by `cursor`; undelivered records replay after a restart.
+- **Waking**: from listed users, private messages, group messages that mention or reply to the bot, button presses, and group additions are delivered to the conversation's agent as the raw record.
 - **Steering**: a user message arriving while the agent is busy is queued as a Pi steer; if the agent has not picked it up within two minutes, the host takes the queued messages back, aborts the run, and prompts with them. Scheduled prompts are queued as follow-ups.
 - **Host tools** (`extensions/host-tools.ts`, loaded with `-e`): `send` (raw Bot API call into the agent's own conversation; local file paths upload), `annotate`, `steer_conversation`, and `schedule_add|replace|remove|take`. They reach the host over `host.sock`.
 - **Schedules** (`schedules.json`): hourly, daily, weekly, or one-off; due schedules wake their owning conversation.
-- **Lifecycle**: agents exit after one idle hour; `/restart` restarts all of them once their current work settles. A new process starts a fresh Pi session in `sessions/`, named `telegram <chat_id>:<thread_id>`.
+- **Lifecycle**: agents exit after one idle hour; `/restart` restarts all of them, killing any still busy after five seconds. A new process starts a fresh Pi session in `sessions/`, named `telegram <chat_id>:<thread_id>`. An agent stopped mid-run, by `/restart` or by the host stopping, is succeeded by a fresh one woken with an `agent_interrupted` record naming the stopped session; `busy.json` carries busy agents' sessions across host restarts.
 
 ## Checks
 

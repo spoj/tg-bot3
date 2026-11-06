@@ -1,11 +1,7 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import path from "node:path";
 import test from "node:test";
-import { setTimeout as sleep } from "node:timers/promises";
 import type { Agents } from "../src/agents.ts";
-import { Router, wakes } from "../src/router.ts";
+import { route, wakes } from "../src/router.ts";
 import type { TimelineRecord } from "../src/timeline.ts";
 
 const record = (seq: number, type: string, meta?: object): TimelineRecord => ({ seq, t: "", type, conversation: { chat_id: 5 }, meta: { allowed_sender: true, ...meta } });
@@ -19,24 +15,19 @@ test("waking rules", () => {
   assert.equal(wakes(record(1, "telegram.message", { user_content: true, directed: true, allowed_sender: false })), false);
 });
 
-test("cursor waits for in-flight deliveries and skips replayed records", async () => {
-  const dir = mkdtempSync(path.join(tmpdir(), "tg-bot3-"));
-  const deliveries: Array<{ message: string; behavior: string; release: () => void }> = [];
-  const agents = {
-    deliver: (_target: unknown, message: string, behavior: string) => new Promise<void>((release) => deliveries.push({ message, behavior, release })),
-  } as unknown as Agents;
-  const router = new Router({ cursorPath: path.join(dir, "cursor"), initialCursor: 0, agents, onError: () => {} });
-  const message = record(2, "telegram.message", { user_content: true, private: true });
-  router.handle(record(1, "schedule_fired"));
-  router.handle(message);
-  router.handle(record(3, "telegram.message_reaction"));
-  assert.deepEqual(deliveries.map((d) => d.behavior), ["followUp", "steer"]);
-  deliveries[1]!.release();
-  await sleep(0);
-  assert.equal(router.cursor, 0);
-  deliveries[0]!.release();
-  await sleep(0);
-  assert.equal(readFileSync(path.join(dir, "cursor"), "utf8"), "3");
-  router.handle(message);
-  assert.equal(deliveries.length, 2);
+test("records reach their conversation's agent as follow-ups, steers, or user steers with a deadline", () => {
+  const deliveries: unknown[][] = [];
+  const agents = { deliver: (...args: unknown[]) => deliveries.push(args) } as unknown as Agents;
+  route(agents, record(1, "schedule_fired"));
+  route(agents, record(2, "steer"));
+  route(agents, record(3, "agent_interrupted"));
+  route(agents, record(4, "telegram.message", { user_content: true, private: true }));
+  route(agents, record(5, "telegram.message_reaction"));
+  route(agents, { seq: 6, t: "", type: "telegram.access_request" });
+  assert.deepEqual(deliveries.map(([target, message, behavior, abortAfterMs]) => [target, JSON.parse(message as string).seq, behavior, abortAfterMs]), [
+    [{ chat_id: 5 }, 1, "followUp", undefined],
+    [{ chat_id: 5 }, 2, "steer", undefined],
+    [{ chat_id: 5 }, 3, "steer", undefined],
+    [{ chat_id: 5 }, 4, "steer", 120_000],
+  ]);
 });

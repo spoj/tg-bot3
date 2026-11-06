@@ -1,5 +1,6 @@
 // Minimal pi RPC stand-in: acknowledges commands and records them on stderr. A prompt starts a run that settles at once
-// for "quick" and otherwise lasts until aborted; prompts during a run are queued.
+// for "quick" and otherwise lasts until aborted; prompts during a run are queued. "settle-first" arrives just after the
+// current run settled on its own.
 let buffer = "";
 let running = false;
 let queue = { steering: [], followUp: [] };
@@ -15,9 +16,20 @@ process.stdin.setEncoding("utf8").on("data", (chunk) => {
       emit({ type: "response", id: command.id, command: command.type, success: false, error: "rejected" });
       continue;
     }
+    if (command.message === "settle-first" && running) {
+      running = false;
+      emit({ type: "agent_settled", aborted: false });
+    }
+    const starts = command.type === "prompt" && !running;
     let data;
-    if (command.type === "prompt" && running) queue[command.streamingBehavior === "followUp" ? "followUp" : "steering"].push(command.message);
-    else if (command.type === "prompt") running = command.message !== "quick";
+    if (command.type === "prompt" && running) {
+      queue[command.streamingBehavior === "followUp" ? "followUp" : "steering"].push(command.message);
+      data = { disposition: "queued" };
+    }
+    if (starts) {
+      running = true;
+      data = { disposition: "started" };
+    }
     if (command.type === "clear_queue") [data, queue] = [queue, { steering: [], followUp: [] }];
     // Like pi, an abort settles the run before it responds.
     if (command.type === "abort" && running) {
@@ -26,6 +38,9 @@ process.stdin.setEncoding("utf8").on("data", (chunk) => {
     }
     emit({ type: "response", id: command.id, command: command.type, success: true, data });
     if (command.message === "ask") emit({ type: "extension_ui_request", id: "ui1", method: "confirm" });
-    if (command.message === "quick") emit({ type: "agent_settled" });
+    if (starts && command.message === "quick") {
+      running = false;
+      emit({ type: "agent_settled", aborted: false });
+    }
   }
 });

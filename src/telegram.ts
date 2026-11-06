@@ -100,7 +100,7 @@ export class Telegram {
     bot.command("restart", async (ctx, next) => {
       if (!allowedSender(ctx)) return next();
       onRestart();
-      await ctx.reply("Restarting agents; each starts a fresh session on its next message.");
+      await ctx.reply("Restarting agents. Busy ones are stopped and resumed in a fresh session; the rest start fresh on their next message.");
     });
 
     bot.use(async (ctx) => {
@@ -129,11 +129,14 @@ export class Telegram {
     bot.catch((error) => console.error("Telegram update failed", (error.error as Error).stack));
   }
 
-  async run(): Promise<void> {
+  async run(onStart: () => void): Promise<void> {
     await this.bot.api.setMyCommands([{ command: "restart", description: "Restart all agents" }]);
     await this.bot.start({
       allowed_updates: UPDATES,
-      onStart: (me) => console.log(`@${me.username} started`),
+      onStart: (me) => {
+        console.log(`@${me.username} started`);
+        onStart();
+      },
     });
   }
 

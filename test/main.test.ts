@@ -20,8 +20,8 @@ test("agents run in the configured cwd and get the state directory's AGENTS.md w
         if (url.endsWith("/src/agents.ts")) return {
           format: "module", shortCircuit: true,
           source: \`export class Agents {
-            constructor(options) {
-              const { command, args, cwd, env } = options({ chat_id: 1, message_thread_id: 7 });
+            constructor({ worker }) {
+              const { command, args, cwd, env } = worker({ chat_id: 1, message_thread_id: 7 }, "s1");
               console.log(JSON.stringify({ command, args, cwd, socket: env.TG_BOT_SOCKET,
                 conversation: env.TG_BOT_CONVERSATION, agentDir: env.PI_CODING_AGENT_DIR }));
             }
@@ -51,6 +51,7 @@ test("agents run in the configured cwd and get the state directory's AGENTS.md w
   assert.equal(plain.socket, path.join(stateDir, "host.sock"));
   assert.equal(plain.conversation, JSON.stringify({ chat_id: 1, message_thread_id: 7 }));
   assert.equal(plain.args[plain.args.indexOf("--session-dir") + 1], path.join(stateDir, "sessions"));
+  assert.equal(plain.args[plain.args.indexOf("--session-id") + 1], "s1");
   assert.equal(plain.prompts.length, 1);
   assert.match(plain.prompts[0], new RegExp(`Bot state lives in ${stateDir}:`));
   assert.equal(existsSync(path.join(stateDir, "attachments")), true);

@@ -3,7 +3,7 @@ import net from "node:net";
 import { homedir } from "node:os";
 import path from "node:path";
 import { Agents } from "./agents.ts";
-import { Router } from "./router.ts";
+import { route } from "./router.ts";
 import { Scheduler } from "./scheduler.ts";
 import { Telegram } from "./telegram.ts";
 import { conversationKey, Timeline, type Conversation } from "./timeline.ts";
@@ -34,42 +34,40 @@ Bot state lives in ${stateDir}:
 - schedules.json: current schedules. Change them only through the schedule tools.
 - sessions/: Pi session transcripts of this bot's agents.
 
-You are woken with timeline records as JSON: private messages, group messages that mention or reply to the bot, button presses, and group additions. A record you already handled may be redelivered after a host restart. Scheduled prompts arrive as schedule_fired records; work handed over by another conversation arrives as steer records. Use steer_conversation to hand work to another conversation instead of sending into its chat.
+You are woken with timeline records as JSON: private messages, group messages that mention or reply to the bot, button presses, and group additions. Scheduled prompts arrive as schedule_fired records; work handed over by another conversation arrives as steer records. Use steer_conversation to hand work to another conversation instead of sending into its chat.
 
-Agents stop after one idle hour or when the user sends /restart (needed after changing Pi settings or extensions); the next message starts a fresh session, so keep anything durable in files or rely on the timeline.
+Agents stop after one idle hour, on /restart (needed after changing Pi settings or extensions), and when the host restarts; the next message starts a fresh session, so keep anything durable in files or rely on the timeline. When an agent is stopped mid-run, a fresh one is woken with an agent_interrupted record whose session names the stopped agent's transcript, sessions/*_<session>.jsonl. Use it and the timeline to find out what was left undone, and finish it.
 `;
 }
 
 const timeline = new Timeline(state("timeline.jsonl"));
 const scheduler = new Scheduler(state("schedules.json"), timeline);
-const agents = new Agents((target) => ({
-  command: config.pi ?? "pi",
-  args: ["--mode", "rpc", "--session-dir", state("sessions"), "--name", `telegram ${conversationKey(target)}`, "--append-system-prompt", runtimePrompt(target), ...(existsSync(state("AGENTS.md")) ? ["--append-system-prompt", state("AGENTS.md")] : []), "-e", hostTools],
-  cwd,
-  env: {
-    ...process.env,
-    ...(config.agentDir && { PI_CODING_AGENT_DIR: expand(config.agentDir) }),
-    TG_BOT_SOCKET: state("host.sock"),
-    TG_BOT_CONVERSATION: JSON.stringify(target),
+const agents = new Agents({
+  busyPath: state("busy.json"),
+  worker: (target, session) => ({
+    command: config.pi ?? "pi",
+    args: ["--mode", "rpc", "--session-dir", state("sessions"), "--session-id", session, "--name", `telegram ${conversationKey(target)}`, "--append-system-prompt", runtimePrompt(target), ...(existsSync(state("AGENTS.md")) ? ["--append-system-prompt", state("AGENTS.md")] : []), "-e", hostTools],
+    cwd,
+    env: {
+      ...process.env,
+      ...(config.agentDir && { PI_CODING_AGENT_DIR: expand(config.agentDir) }),
+      TG_BOT_SOCKET: state("host.sock"),
+      TG_BOT_CONVERSATION: JSON.stringify(target),
+    },
+  }),
+  onInterrupted: (conversation, session) => timeline.publish({ type: "agent_interrupted", conversation, session }),
+  onError: (target, error) => {
+    console.error(`Agent for ${conversationKey(target)} failed`, error);
+    telegram.send(target, { method: "sendMessage", text: `Agent failed: ${error.message.slice(0, 3_000)}` })
+      .catch((sendError: Error) => console.error("Reporting an agent failure failed", sendError.stack));
   },
-}));
+});
 const telegram = new Telegram({
   token: config.token,
   timeline,
   allowedPath: state("allowed.json"),
   attachmentsDir: state("attachments"),
   onRestart: () => agents.restart(),
-});
-const router = new Router({
-  cursorPath: state("cursor"),
-  initialCursor: timeline.seq,
-  agents,
-  onError: (target, error) => {
-    console.error(`Delivery to ${conversationKey(target)} failed`, error);
-    void telegram.bot.api.sendMessage(target.chat_id, `Agent failed: ${String(error).slice(0, 3_000)}`, {
-      ...(target.message_thread_id && { message_thread_id: target.message_thread_id }),
-    }).catch(() => {});
-  },
 });
 
 const tools: Record<string, (caller: Conversation, params: any) => unknown> = {
@@ -100,9 +98,7 @@ const server = net.createServer((socket) => {
 rmSync(state("host.sock"), { force: true });
 server.listen(state("host.sock"));
 
-timeline.subscribe((record) => router.handle(record));
-for (const record of timeline.read()) router.handle(record);
-scheduler.start();
+timeline.subscribe((record) => route(agents, record));
 
 // grammY errors print the token in request URLs and API objects, so only their stacks are logged.
 async function shutdown(): Promise<void> {
@@ -115,7 +111,11 @@ async function shutdown(): Promise<void> {
 process.once("SIGINT", shutdown);
 process.once("SIGTERM", shutdown);
 
-await telegram.run().catch((error: Error) => {
+// Agents start once Telegram is reachable, so a host failing to connect does not wake them on every restart.
+await telegram.run(() => {
+  agents.recover();
+  scheduler.start();
+}).catch((error: Error) => {
   console.error("Telegram polling failed", error.stack);
   process.exit(1);
 });
