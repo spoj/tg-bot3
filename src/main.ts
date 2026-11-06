@@ -85,6 +85,7 @@ const tools: Record<string, (caller: Conversation, params: any) => unknown> = {
 // Host tools: the extension sends one JSON line {caller, tool, params} and reads one JSON reply.
 const server = net.createServer((socket) => {
   let buffer = "";
+  socket.on("error", (error) => console.error("Host tool connection failed", error));
   socket.setEncoding("utf8").on("data", async (chunk: string) => {
     buffer += chunk;
     if (!buffer.includes("\n")) return;
