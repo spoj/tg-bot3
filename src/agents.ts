@@ -30,8 +30,10 @@ export class Worker {
   private settledWaiters: Array<() => void> = [];
   private running = false;
   private prompting = 0;
+  private interrupting = false;
+  private promptQueue = Promise.resolve();
   private runError: string | undefined;
-  private dead = false;
+  dead = false;
   private stderr = "";
   private abortTimer: NodeJS.Timeout | undefined;
   private idleTimer: NodeJS.Timeout | undefined;
@@ -72,47 +74,64 @@ export class Worker {
   }
 
   get busy(): boolean {
-    return this.running || this.prompting > 0;
+    return this.running || this.prompting > 0 || this.interrupting;
   }
 
   /** Resolves once pi has answered the prompt; failures go to onError. */
   async prompt(message: string, behavior: Behavior, abortAfterMs?: number): Promise<void> {
+    if (this.dead || this.closing) return;
     if (!this.busy) {
       clearTimeout(this.idleTimer);
       this.events.onBusy();
     }
     this.prompting++;
-    try {
-      // Runs as the response is read, before any later event, such as agent_settled, is handled.
-      await this.request({ type: "prompt", message, streamingBehavior: behavior }, ({ data }) => {
+    const next = this.promptQueue.then(async () => {
+      if (this.dead) return;
+      if (this.closing) {
         this.prompting--;
-        if (data?.disposition === "started") this.running = true;
-        // A queued user message interrupts a long-running turn so the agent picks it up promptly.
-        if (data?.disposition === "queued" && abortAfterMs !== undefined) {
-          this.abortTimer ??= setTimeout(() => {
-            this.abortTimer = undefined;
-            this.interrupt().catch((error) => console.error("Interrupting pi failed", error));
-          }, abortAfterMs);
-        }
-        if (!this.busy) this.settle(false);
-      });
-    } catch (error) {
-      if (!this.dead) this.events.onError(error as Error);
-    }
+        if (!this.busy) this.settle(true);
+        return;
+      }
+      try {
+        // Runs as the response is read, before any later event, such as agent_settled, is handled.
+        await this.request({ type: "prompt", message, streamingBehavior: behavior }, ({ data }) => {
+          this.prompting--;
+          if (data?.disposition === "started") this.running = true;
+          // A queued user message interrupts a long-running turn so the agent picks it up promptly.
+          if (data?.disposition === "queued" && abortAfterMs !== undefined) {
+            this.abortTimer ??= setTimeout(() => {
+              this.abortTimer = undefined;
+              this.interrupt(abortAfterMs).catch((error) => console.error("Interrupting pi failed", error));
+            }, abortAfterMs);
+          }
+          if (!this.busy) this.settle(this.closing);
+        });
+      } catch (error) {
+        if (!this.dead) this.events.onError(error as Error);
+      }
+    });
+    this.promptQueue = next;
+    await next;
   }
 
   /**
    * Aborts the run and prompts with its queued steers. They leave the queue first: an aborted run would take
    * them into the session and end without answering them.
    */
-  private async interrupt(): Promise<void> {
-    const { steering, followUp } = await this.request({ type: "clear_queue" });
-    // Pi may have taken the steers just before the deadline.
-    if (steering.length > 0) {
-      await this.request({ type: "abort" });
-      await this.prompt(steering.join("\n\n"), "steer");
+  private async interrupt(abortAfterMs?: number): Promise<void> {
+    this.interrupting = true;
+    try {
+      const { steering, followUp } = await this.request({ type: "clear_queue" });
+      // Pi may have taken the steers just before the deadline.
+      if (steering.length > 0) {
+        await this.request({ type: "abort" });
+        await this.prompt(steering.join("\n\n"), "steer", abortAfterMs);
+      }
+      for (const message of followUp) await this.prompt(message, "followUp");
+    } finally {
+      this.interrupting = false;
+      if (!this.dead && !this.busy) this.settle(this.closing);
     }
-    for (const message of followUp) await this.prompt(message, "followUp");
   }
 
   waitSettled(): Promise<void> {
@@ -120,7 +139,10 @@ export class Worker {
   }
 
   close(killAfterMs = KILL_GRACE_MS): Promise<void> {
+    if (this.closing) return this.exited;
     this.closing = true;
+    clearTimeout(this.abortTimer);
+    this.abortTimer = undefined;
     this.child.stdin.end();
     const timer = setTimeout(() => {
       try {
@@ -158,14 +180,15 @@ export class Worker {
     } else if (event.type === "queue_update" && event.steering?.length === 0) {
       clearTimeout(this.abortTimer);
       this.abortTimer = undefined;
-    } else if (event.type === "agent_end" && !event.willRetry && event.messages.at(-1)?.stopReason === "error") {
-      this.runError = event.messages.at(-1).errorMessage;
+    } else if (event.type === "agent_end") {
+      const last = event.messages.at(-1);
+      this.runError = !event.willRetry && last?.stopReason === "error" ? (last.errorMessage || "pi run failed") : undefined;
     } else if (event.type === "agent_settled") {
       // An abort can also end a run in an error; only failures nobody asked for are reported.
       if (this.runError !== undefined && !event.aborted) this.events.onError(new Error(this.runError));
       this.runError = undefined;
       this.running = false;
-      if (!this.busy) this.settle(event.aborted);
+      if (!this.busy) this.settle(this.closing);
     }
   }
 
@@ -203,6 +226,8 @@ type Agent = { worker: Worker; session: string; conversation: Conversation };
 /** One worker per conversation, started on demand. */
 export class Agents {
   private readonly agents = new Map<string, Agent>();
+  private readonly restarting = new Set<Promise<void>>();
+  private stopping = false;
   private readonly busy: Record<string, Conversation>;
   private readonly options: AgentsOptions;
 
@@ -217,9 +242,10 @@ export class Agents {
   }
 
   deliver(conversation: Conversation, message: string, behavior: Behavior, abortAfterMs?: number): void {
+    if (this.stopping) return;
     const key = conversationKey(conversation);
     let agent = this.agents.get(key);
-    if (!agent || agent.worker.closing) {
+    if (!agent || agent.worker.closing || agent.worker.dead) {
       const session = randomUUID();
       const worker = new Worker(this.options.worker(conversation, session), {
         onBusy: () => {
@@ -245,26 +271,29 @@ export class Agents {
   /** Detaches every agent now; one still busy after the grace is killed and its conversation woken fresh. */
   restart(graceMs = RESTART_GRACE_MS): void {
     for (const { worker, session, conversation } of this.agents.values()) {
-      void Promise.race([worker.waitSettled(), sleep(graceMs)]).then(async () => {
+      const task = Promise.race([worker.waitSettled(), sleep(graceMs)]).then(async () => {
         const interrupted = worker.busy;
-        await worker.close(0);
-        if (interrupted) this.interrupted(session, conversation);
+        await worker.close();
+        if (interrupted && !this.stopping) this.interrupted(session, conversation);
       });
+      this.restarting.add(task);
+      void task.finally(() => this.restarting.delete(task));
     }
     this.agents.clear();
   }
 
   /** Stops every agent; busy ones stay recorded for the next host. */
   async closeAll(): Promise<void> {
+    this.stopping = true;
     const agents = [...this.agents.values()];
     this.agents.clear();
-    await Promise.all(agents.map(({ worker }) => worker.close()));
+    await Promise.all([...agents.map(({ worker }) => worker.close()), ...this.restarting]);
   }
 
   private interrupted(session: string, conversation: Conversation): void {
+    this.options.onInterrupted(conversation, session);
     delete this.busy[session];
     this.save();
-    this.options.onInterrupted(conversation, session);
   }
 
   private save(): void {

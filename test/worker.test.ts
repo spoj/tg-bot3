@@ -32,7 +32,22 @@ test("user steer still queued at the deadline aborts the run and is prompted aga
     ["prompt", "next", "steer"],
     ["prompt", "later", "followUp"],
   ]);
-  assert.deepEqual(events, [["busy"], ["settled", true], ["busy"]]);
+  assert.deepEqual(events, [["busy"]]);
+  await worker.close();
+});
+
+test("back-to-back prompts wait for RPC acceptance before sending the next prompt", async () => {
+  const { worker, events, commands } = fakeWorker();
+  await Promise.all([worker.prompt("slow-start", "steer"), worker.prompt("second", "steer", 40)]);
+  await sleep(120);
+  assert.deepEqual(commands().map(({ type, message }) => [type, message]), [
+    ["prompt", "slow-start"],
+    ["prompt", "second"],
+    ["clear_queue", undefined],
+    ["abort", undefined],
+    ["prompt", "second"],
+  ]);
+  assert.deepEqual(events, [["busy"]]);
   await worker.close();
 });
 
@@ -49,12 +64,22 @@ test("settled worker does not abort, declines dialogs, and reports rejected prom
   await worker.close();
 });
 
-test("a run that fails is reported", async () => {
+test("a run that fails is reported, recovered overflow is not, and empty error messages still report", async () => {
   const { worker, events } = fakeWorker();
   await worker.prompt("error", "steer");
-  await sleep(50);
-  assert.deepEqual(events, [["busy"], ["error", "Overloaded"], ["settled", false]]);
+  await worker.waitSettled();
+  await worker.prompt("overflow-recover", "steer");
+  await worker.waitSettled();
+  await worker.prompt("empty-error", "steer");
+  await worker.waitSettled();
+  assert.deepEqual(events, [
+    ["busy"], ["error", "Overloaded"], ["settled", false],
+    ["busy"], ["settled", false],
+    ["busy"], ["error", "pi run failed"], ["settled", false],
+  ]);
   await worker.close();
+  await worker.prompt("ignored-after-close", "steer");
+  assert.equal(worker.busy, false);
 });
 
 test("a run that starts just after the previous one settled stays busy and gets no steer deadline", async () => {

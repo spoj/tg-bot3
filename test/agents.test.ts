@@ -66,3 +66,31 @@ test("a delivery while an idle agent shuts down starts a new agent", async () =>
   assert.deepEqual(errors, []);
   await agents.closeAll();
 });
+
+test("interrupted handoff keeps the old session recorded until onInterrupted finishes, and closeAll drains restarting workers", async () => {
+  const { agents, busyPath, sessions, busy } = setup();
+  agents.deliver(alice, "long", "steer");
+  await sleep(50);
+  await agents.closeAll();
+
+  const seenDuringHandoff: Array<Record<string, Conversation>> = [];
+  const nextSessions: string[] = [];
+  const next = new Agents({
+    busyPath,
+    worker: (_c, session) => {
+      nextSessions.push(session);
+      return { command: process.execPath, args: [`${import.meta.dirname}/fake-pi.mjs`], cwd: import.meta.dirname, env: process.env };
+    },
+    onInterrupted: (conversation) => {
+      next.deliver(conversation, "long", "steer");
+      seenDuringHandoff.push(busy());
+    },
+    onError: () => {},
+  });
+  next.recover();
+  assert.deepEqual(seenDuringHandoff, [{ [sessions[0]!]: alice, [nextSessions[0]!]: alice }]);
+  assert.deepEqual(busy(), { [nextSessions[0]!]: alice });
+  next.restart(200);
+  await next.closeAll();
+  assert.deepEqual(busy(), { [nextSessions[0]!]: alice });
+});
