@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, readFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, truncateSync } from "node:fs";
 
 export type Conversation = { chat_id: number; message_thread_id?: number };
 export type TimelineEvent = { type: string; conversation?: Conversation } & Record<string, any>;
@@ -19,6 +19,11 @@ export class Timeline {
 
   constructor(path: string) {
     this.path = path;
+    if (existsSync(path)) {
+      const bytes = readFileSync(path);
+      const end = bytes.lastIndexOf(10) + 1;
+      if (end < bytes.length) truncateSync(path, end);
+    }
     this.seq = this.read().at(-1)?.seq ?? 0;
   }
 

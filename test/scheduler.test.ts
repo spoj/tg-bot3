@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { appendFileSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -43,4 +43,32 @@ test("only the owner changes a schedule until another conversation takes it", ()
   assert.deepEqual(scheduler.schedules[0]!.owner, bob);
   assert.deepEqual(timeline.read().map((record) => record.type), ["schedule_added", "schedule_taken", "schedule_replaced"]);
   assert.throws(() => scheduler.add(alice, { prompt: "c", start: "tomorrow", recurrence: null }), /UTC/);
+  assert.throws(() => scheduler.add(alice, { prompt: "c", start: "tomorrow 1 Z", recurrence: null }), /UTC/);
+  assert.throws(() => scheduler.add(alice, { prompt: "c", start: "2030-02-30T09:00:00Z", recurrence: null }), /UTC/);
+  assert.throws(() => scheduler.add(alice, { prompt: "c", start: "2030-01-01T09:00:00Z", recurrence: "monthly" as any }), /recurrence/);
+});
+
+test("replacing recurrence recomputes due time from start, equivalent Z/.000Z starts do not refire, and torn timeline tails truncate", () => {
+  const { dir, timeline, scheduler } = setup();
+  const realNow = Date.now;
+  Date.now = () => Date.parse("2030-01-01T09:05:00Z");
+  try {
+    const s = scheduler.add(alice, { prompt: "p", start: "2030-01-01T09:00:00Z", recurrence: "weekly" });
+    scheduler.tick(Date.parse("2030-01-01T09:01:00Z"));
+    assert.equal(s.next_due_at, "2030-01-08T09:00:00.000Z");
+    assert.equal(scheduler.replace(alice, { id: s.id, prompt: "p2", start: "2030-01-01T09:00:00.000Z", recurrence: "weekly" }).next_due_at, "2030-01-08T09:00:00.000Z");
+    assert.equal(scheduler.replace(alice, { id: s.id, prompt: "p3", start: "2030-01-01T09:00:00Z", recurrence: "hourly" }).next_due_at, "2030-01-01T10:00:00.000Z");
+    assert.equal(scheduler.replace(alice, { id: s.id, prompt: "p4", start: "2030-01-01T09:00:00Z", recurrence: null }).next_due_at, null);
+  } finally {
+    Date.now = realNow;
+  }
+
+  const countBefore = timeline.read().length;
+  appendFileSync(path.join(dir, "timeline.jsonl"), '{"seq":999,"type":"torn');
+  const reopened = new Timeline(path.join(dir, "timeline.jsonl"));
+  assert.equal(reopened.read().length, countBefore);
+  assert.equal(reopened.publish({ type: "after_repair" }).seq, countBefore + 1);
+
+  appendFileSync(path.join(dir, "timeline.jsonl"), "{corrupt_complete_line}\n");
+  assert.throws(() => new Timeline(path.join(dir, "timeline.jsonl")), SyntaxError);
 });

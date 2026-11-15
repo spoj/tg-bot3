@@ -16,7 +16,16 @@ export function nextDue(dueAt: string, recurrence: Exclude<Recurrence, null>, no
 }
 
 function input({ prompt, start, recurrence }: ScheduleInput): ScheduleInput {
-  if (!start.endsWith("Z") || Number.isNaN(Date.parse(start))) throw new Error("start must be a UTC ISO-8601 timestamp ending in Z");
+  if (typeof prompt !== "string") throw new Error("prompt must be a string");
+  const match = typeof start === "string" ? /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2})(?::(\d{2})(?:\.(\d+))?)?Z$/.exec(start) : null;
+  const ms = match ? Date.parse(start) : Number.NaN;
+  const canonical = match ? `${match[1]}:${match[2] ?? "00"}.${(match[3] ?? "").padEnd(3, "0").slice(0, 3)}Z` : "";
+  if (!match || Number.isNaN(ms) || new Date(ms).toISOString() !== canonical) {
+    throw new Error("start must be a UTC ISO-8601 timestamp ending in Z");
+  }
+  if (recurrence !== null && !["hourly", "daily", "weekly"].includes(recurrence)) {
+    throw new Error("recurrence must be hourly, daily, weekly, or null");
+  }
   return { prompt, start, recurrence };
 }
 
@@ -43,9 +52,11 @@ export class Scheduler {
   replace(actor: Conversation, params: ScheduleInput & { id: string }): Schedule {
     const current = this.get(params.id, actor);
     const fields = input(params);
-    const nextDueAt = fields.start !== current.start
+    const nextDueAt = Date.parse(fields.start) !== Date.parse(current.start)
       ? fields.start
-      : current.next_due_at ?? (fields.recurrence && nextDue(fields.start, fields.recurrence, Date.now()));
+      : fields.recurrence !== current.recurrence && current.next_due_at !== null && Date.parse(current.next_due_at) !== Date.parse(current.start)
+        ? (fields.recurrence && nextDue(fields.start, fields.recurrence, Date.now()))
+        : current.next_due_at ?? (fields.recurrence && nextDue(fields.start, fields.recurrence, Date.now()));
     const replacement = { id: current.id, ...fields, owner: current.owner, next_due_at: nextDueAt };
     this.schedules[this.schedules.indexOf(current)] = replacement;
     this.commit(actor, "schedule_replaced", current.id, current, replacement);
@@ -76,7 +87,7 @@ export class Scheduler {
         prompt: schedule.prompt,
         dueAt: schedule.next_due_at,
       });
-      schedule.next_due_at = schedule.recurrence && nextDue(schedule.next_due_at, schedule.recurrence, now);
+      schedule.next_due_at = schedule.recurrence && nextDue(schedule.start, schedule.recurrence, now);
       this.save();
     }
   }
