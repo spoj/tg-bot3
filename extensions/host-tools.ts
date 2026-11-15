@@ -1,10 +1,13 @@
 import net from "node:net";
+import { addAbortSignal } from "node:stream";
 import { Type, type TSchema } from "typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-async function callHost(tool: string, params: unknown): Promise<unknown> {
+async function callHost(tool: string, params: unknown, signal?: AbortSignal): Promise<unknown> {
+  signal?.throwIfAborted();
   const reply = await new Promise<string>((resolve, reject) => {
     const socket = net.connect(process.env.TG_BOT_SOCKET!);
+    if (signal) addAbortSignal(signal, socket);
     let buffer = "";
     socket.setEncoding("utf8");
     socket.on("connect", () => socket.write(`${JSON.stringify({ caller: JSON.parse(process.env.TG_BOT_CONVERSATION!), tool, params })}\n`));
@@ -56,8 +59,8 @@ export default function hostTools(pi: ExtensionAPI): void {
       label: name,
       description,
       parameters,
-      async execute(_toolCallId, params) {
-        const result = await callHost(name, params);
+      async execute(_toolCallId, params, signal) {
+        const result = await callHost(name, params, signal);
         return { content: [{ type: "text", text: JSON.stringify(result) }], details: {} };
       },
     });

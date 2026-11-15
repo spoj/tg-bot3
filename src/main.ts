@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import net from "node:net";
 import { homedir } from "node:os";
 import path from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import { Agents } from "./agents.ts";
 import { route } from "./router.ts";
 import { Scheduler } from "./scheduler.ts";
@@ -14,7 +15,14 @@ const expand = (value: string) => path.resolve(value.replace(/^~(?=\/|$)/, homed
 if (!process.argv[2]) throw new Error("usage: node src/main.ts <state directory>");
 const stateDir = expand(process.argv[2]);
 const state = (name: string) => path.join(stateDir, name);
-const config: Config = JSON.parse(readFileSync(state("config.json"), "utf8"));
+const rawConfig = readFileSync(state("config.json"), "utf8");
+let config: Config;
+try {
+  config = JSON.parse(rawConfig);
+} catch {
+  console.error(`Invalid JSON in ${state("config.json")}`);
+  process.exit(1);
+}
 const cwd = expand(config.cwd);
 const hostTools = path.join(import.meta.dirname, "..", "extensions", "host-tools.ts");
 mkdirSync(state("attachments"), { recursive: true });
@@ -39,6 +47,18 @@ You are woken with timeline records as JSON: private messages, group messages th
 Agents stop after one idle hour, on /restart (needed after changing Pi settings or extensions), and when the host restarts; the next message starts a fresh session, so keep anything durable in files or rely on the timeline. When an agent is stopped mid-run, a fresh one is woken with an agent_interrupted record whose session names the stopped agent's transcript, sessions/*_<session>.jsonl. Use it and the timeline to find out what was left undone, and finish it.
 `;
 }
+
+await new Promise<void>((resolve, reject) => {
+  const probe = net.connect(state("host.sock"));
+  probe.on("connect", () => {
+    probe.destroy();
+    reject(new Error(`Another bot is already using ${stateDir}`));
+  });
+  probe.on("error", (error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT" || error.code === "ECONNREFUSED") resolve();
+    else reject(error);
+  });
+});
 
 const timeline = new Timeline(state("timeline.jsonl"));
 const scheduler = new Scheduler(state("schedules.json"), timeline);
@@ -86,9 +106,12 @@ const server = net.createServer((socket) => {
   socket.on("error", (error) => console.error("Host tool connection failed", error));
   socket.setEncoding("utf8").on("data", async (chunk: string) => {
     buffer += chunk;
-    if (!buffer.includes("\n")) return;
+    const newline = buffer.indexOf("\n");
+    if (newline === -1) return;
+    socket.removeAllListeners("data");
     try {
-      const { caller, tool, params } = JSON.parse(buffer);
+      const { caller, tool, params } = JSON.parse(buffer.slice(0, newline));
+      if (!Object.hasOwn(tools, tool)) throw new Error(`Unknown host tool ${tool}`);
       socket.end(JSON.stringify({ ok: true, result: (await tools[tool]!(caller, params)) ?? null }));
     } catch (error) {
       socket.end(JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) }));
@@ -101,21 +124,32 @@ server.listen(state("host.sock"));
 timeline.subscribe((record) => route(agents, record));
 
 // grammY errors print the token in request URLs and API objects, so only their stacks are logged.
-async function shutdown(): Promise<void> {
-  scheduler.stop();
-  server.close();
-  await telegram.bot.stop().catch((error: Error) => console.error("Stopping Telegram polling failed", error.stack));
-  await agents.closeAll();
-  process.exit(0);
+let shuttingDown: Promise<void> | undefined;
+function shutdown(code = 0): Promise<void> {
+  return shuttingDown ??= (async () => {
+    scheduler.stop();
+    await Promise.race([
+      Promise.all([
+        telegram.bot.stop().catch((error: Error) => console.error("Stopping Telegram polling failed", error.stack)),
+        running.catch(() => {}),
+      ]),
+      sleep(3_000),
+    ]);
+    await agents.closeAll();
+    server.close();
+    process.exit(code);
+  })();
 }
-process.once("SIGINT", shutdown);
-process.once("SIGTERM", shutdown);
+process.on("SIGINT", () => void shutdown());
+process.on("SIGTERM", () => void shutdown());
 
 // Agents start once Telegram is reachable, so a host failing to connect does not wake them on every restart.
-await telegram.run(() => {
+const running = telegram.run(() => {
+  if (shuttingDown) return;
   agents.recover();
   scheduler.start();
-}).catch((error: Error) => {
+});
+await running.catch((error: Error) => {
   console.error("Telegram polling failed", error.stack);
-  process.exit(1);
+  return shutdown(1);
 });

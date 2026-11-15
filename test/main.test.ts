@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import net from "node:net";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
+import hostTools from "../extensions/host-tools.ts";
 
 const main = path.resolve(import.meta.dirname, "../src/main.ts");
 
@@ -63,4 +65,35 @@ test("agents run in the configured cwd and get the state directory's AGENTS.md w
   assert.equal(custom.command, "custom-pi");
   assert.equal(custom.agentDir, path.join(homedir(), "profile"));
   assert.deepEqual(custom.prompts.slice(1), [path.join(stateDir, "AGENTS.md")]);
+});
+
+test("malformed config.json does not log the token, live host.sock refuses a second host, and host tools honor AbortSignal", async (t) => {
+  const dir = mkdtempSync(path.join(tmpdir(), "tg-bot3-main-safety-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const stateDir = path.join(dir, "state");
+  mkdirSync(stateDir);
+  const secret = "123456789:SECRET_TOKEN_VALUE_DO_NOT_LOG";
+  writeFileSync(path.join(stateDir, "config.json"), `{"token":'${secret}',"cwd":"~"}`);
+  const bad = spawnSync(process.execPath, [main, stateDir], { encoding: "utf8", timeout: 5_000 });
+  assert.notEqual(bad.status, 0);
+  assert.equal(bad.stderr.includes(secret), false);
+  assert.equal(bad.stdout.includes(secret), false);
+
+  writeFileSync(path.join(stateDir, "config.json"), JSON.stringify({ token: "unused", cwd: "~" }));
+  const sock = path.join(stateDir, "host.sock");
+  const server = net.createServer();
+  await new Promise<void>((resolve) => server.listen(sock, resolve));
+  t.after(() => server.close());
+
+  const duplicate = spawnSync(process.execPath, [main, stateDir], { encoding: "utf8", timeout: 5_000 });
+  assert.notEqual(duplicate.status, 0);
+  assert.match(duplicate.stderr, /already using/);
+
+  const registered = new Map<string, any>();
+  hostTools({ registerTool: (def: any) => registered.set(def.name, def) } as any);
+  process.env.TG_BOT_SOCKET = sock;
+  process.env.TG_BOT_CONVERSATION = JSON.stringify({ chat_id: 1 });
+  const ac = new AbortController();
+  setTimeout(() => ac.abort(), 30);
+  await assert.rejects(registered.get("send").execute("id1", { method: "sendMessage", text: "hi" }, ac.signal), /AbortError|aborted/i);
 });
