@@ -11,7 +11,7 @@ const UPDATES = [
   "poll_answer", "message_reaction", "my_chat_member", "chat_join_request",
 ] as const;
 const MESSAGE_UPDATES = new Set(["message", "edited_message", "channel_post", "edited_channel_post"]);
-const MEDIA_FIELDS = ["photo", "audio", "video", "animation", "voice", "video_note", "document", "sticker"];
+const MEDIA_FIELDS = ["photo", "audio", "video", "animation", "voice", "video_note", "document", "sticker", "thumbnail", "cover"];
 const SERVICE_FIELDS = [
   "forum_topic_created", "forum_topic_closed", "forum_topic_reopened", "forum_topic_edited",
   "general_forum_topic_hidden", "general_forum_topic_unhidden", "new_chat_members", "left_chat_member",
@@ -29,7 +29,7 @@ export type TelegramOptions = {
 };
 
 function isDirected(message: Message, me: UserFromGetMe): boolean {
-  if (message.reply_to_message?.from?.id === me.id) return true;
+  if (message.reply_to_message?.from?.id === me.id && !message.reply_to_message.forum_topic_created) return true;
   const text = message.text ?? message.caption ?? "";
   return (message.entities ?? message.caption_entities ?? []).some((entity) => entity.type === "text_mention"
     ? entity.user.id === me.id
@@ -43,8 +43,17 @@ async function download(bot: Bot, token: string, directory: string, message: Mes
   if (!file) return [];
   try {
     const info = await bot.api.getFile(file.file_id);
-    const name = path.basename(("file_name" in file && file.file_name) || info.file_path!);
-    const target = path.join(directory, String(message.chat.id), String(message.message_id), name);
+    if (!info.file_path) throw new Error("Telegram returned no file_path");
+    const candidate = "file_name" in file && file.file_name ? path.basename(file.file_name) : "";
+    const name = candidate && candidate !== "." && candidate !== ".." ? candidate : path.basename(info.file_path);
+    if (!name || name === "." || name === "..") throw new Error("Invalid attachment file name");
+    const target = path.join(
+      directory,
+      String(message.chat.id),
+      String(message.message_id),
+      ...(file.file_unique_id ? [path.basename(file.file_unique_id)] : []),
+      name,
+    );
     const response = await fetch(`https://api.telegram.org/file/bot${token}/${info.file_path}`);
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     mkdirSync(path.dirname(target), { recursive: true });
@@ -69,7 +78,7 @@ export class Telegram {
     // grammY's default agent bypasses Node's environment proxy support.
     const bot = new Bot(token, { client: { baseFetchConfig: { agent: globalAgent } } });
     this.bot = bot;
-    const reported = new Set<number | undefined>();
+    const reported = new Set<number>();
     const allowedIds = (): number[] => existsSync(allowedPath) ? JSON.parse(readFileSync(allowedPath, "utf8")) : [];
     const sender = (ctx: Context) => ctx.from ?? ctx.pollAnswer?.user;
     const allowedSender = (ctx: Context) => allowedIds().some((id) => id === sender(ctx)?.id);
@@ -84,14 +93,15 @@ export class Telegram {
         : ids.includes(chat.id) && (await bot.api.getChatAdministrators(chat.id)).some((admin) => ids.includes(admin.user.id));
       if (accepted) return next();
       const user = sender(ctx);
-      const key = chat?.id ?? user?.id;
-      if (reported.has(key)) return;
+      const requestChat = chat ?? ctx.pollAnswer?.voter_chat;
+      const key = requestChat?.id ?? user?.id;
+      if (key === undefined || reported.has(key)) return;
       reported.add(key);
       timeline.publish({
         type: "telegram.access_request",
         payload: {
           update_type: updateType(ctx),
-          chat: chat && { id: chat.id, type: chat.type },
+          chat: requestChat && { id: requestChat.id, type: requestChat.type },
           from: user && { id: user.id, username: user.username },
         },
       });
@@ -106,6 +116,7 @@ export class Telegram {
     bot.use(async (ctx) => {
       const type = updateType(ctx);
       const payload = (ctx.update as Record<string, any>)[type];
+      if (type === "callback_query") void ctx.answerCallbackQuery().catch(() => {});
       const target = this.conversationOf(ctx, type, payload);
       if (!target) return;
       const meta: Record<string, boolean> = { allowed_sender: allowedSender(ctx) };
@@ -121,7 +132,6 @@ export class Telegram {
         const { old_chat_member: before, new_chat_member: after } = payload;
         meta.group_add = ["member", "administrator"].includes(after.status) && ["left", "kicked"].includes(before.status);
       }
-      if (type === "callback_query") void ctx.answerCallbackQuery().catch(() => {});
       timeline.publish(event);
     });
 
@@ -145,13 +155,25 @@ export class Telegram {
     params.chat_id = target.chat_id;
     if (target.message_thread_id) params.message_thread_id ??= target.message_thread_id;
     for (const field of MEDIA_FIELDS) if (field in params) params[field] = localFile(params[field]);
-    if (Array.isArray(params.media)) params.media = params.media.map((item) => ({ ...item, media: localFile(item.media) }));
+    if (params.media && typeof params.media === "object") {
+      const convert = (item: Record<string, any>) => {
+        const copy: Record<string, any> = { ...item, media: localFile(item.media) };
+        for (const field of ["thumbnail", "cover"]) if (field in copy) copy[field] = localFile(copy[field]);
+        return copy;
+      };
+      params.media = Array.isArray(params.media) ? params.media.map(convert) : convert(params.media);
+    }
     const call = (this.bot.api.raw as Record<string, any>)[method];
-    if (!call) throw new Error(`Unknown Telegram Bot API method ${method}`);
+    if (typeof call !== "function") throw new Error(`Unknown Telegram Bot API method ${method}`);
     for (;;) {
       try {
         const response = await call(params);
-        this.timeline.publish({ type: "telegram.sent", conversation: target, request, response });
+        this.timeline.publish({
+          type: "telegram.sent",
+          conversation: conversation(target.chat_id, typeof params.message_thread_id === "number" ? params.message_thread_id : undefined),
+          request,
+          response,
+        });
         return response;
       } catch (error) {
         const retryAfter = error instanceof GrammyError ? error.parameters.retry_after : undefined;
@@ -165,10 +187,14 @@ export class Telegram {
     if (type === "poll_answer") {
       return this.timeline.find((record) => (record.payload?.poll?.id ?? record.response?.poll?.id) === payload.poll_id)?.conversation;
     }
-    const chatId = ctx.chat!.id;
+    if (!ctx.chat) return undefined;
+    const chatId = ctx.chat.id;
     if (type === "message_reaction") {
       return this.timeline.find((record) => record.conversation?.chat_id === chatId
-        && (record.payload?.message_id ?? record.response?.message_id) === payload.message_id)?.conversation
+        && (record.payload?.message_id === payload.message_id
+          || (Array.isArray(record.response)
+            ? record.response.some((item) => item?.message_id === payload.message_id)
+            : record.response?.message_id === payload.message_id)))?.conversation
         ?? conversation(chatId);
     }
     return conversation(chatId, ctx.msg?.is_topic_message ? ctx.msg.message_thread_id : undefined);
