@@ -27,6 +27,7 @@ If the state directory is in a Git repo, ignore `config.json`, `busy.json`, `hos
 | `cwd` | required | Agent working directory |
 | `agentDir` | Pi's default (`~/.pi/agent`) | Sets `PI_CODING_AGENT_DIR` for agents |
 | `pi` | `pi` | Pi command |
+| `lmk` | disabled | Optional [letmeknow bridge](#letmeknow-bridge) |
 
 Paths are absolute; `~` expands to your home directory.
 
@@ -46,6 +47,27 @@ Files named below are in the state directory.
 - **Host tools** (`extensions/host-tools.ts`, loaded with `-e`): `send` (raw Bot API call into the agent's own conversation; local file paths upload), `annotate`, `steer_conversation`, and `schedule_add|replace|remove|take`. They reach the host over `host.sock`.
 - **Schedules** (`schedules.json`): hourly, daily, weekly, or one-off; due schedules wake their owning conversation.
 - **Lifecycle**: agents exit after one idle hour; `/restart` restarts all of them, killing any still busy after five seconds. A new process starts a fresh Pi session in `sessions/`, named `telegram <chat_id>:<thread_id>`. An agent stopped mid-run, by `/restart` or by the host stopping, is succeeded by a fresh one woken with an `agent_interrupted` record naming the stopped session; `busy.json` carries busy agents' sessions across host restarts. A failed run is reported in its chat as `Agent failed: …`.
+
+## letmeknow bridge
+
+To bridge a [letmeknow](https://letmeknow.dev) session into a chat with Telegram topics, add this to `config.json`:
+
+```json
+"lmk": { "session": "<session fingerprint>", "letmeknow": "npx -y @letmeknow/cli@0.26", "chat": -1001234567890, "user": 123456789 }
+```
+
+Add the chat and user to `allowed.json`. For a private chat, both IDs are the user's ID and the bot needs Threaded Mode enabled in BotFather. In a forum group, the bot needs permission to manage topics. Use a session in a trusted group: members can send raw Bot API calls through the bot.
+
+- Incoming text and files go to the sender's fingerprint topic, created on demand. A `*.json` attachment is a Bot API request instead; it may specify `message_thread_id` (use `null` for no thread). The bridge fixes `chat_id` to the configured chat, does not upload host paths from JSON requests, and reserves polling and webhook management for the bot. Results go to the letmeknow log, with a file attached for `getFile`; errors come back as replies. Bot API calls also appear in `timeline.jsonl`.
+- Only the configured user's updates in bridge-bound topics, or replies, button presses, reactions and poll answers tied to tracked bridge messages, go to letmeknow. They go to the relevant member as raw Telegram update JSON, with downloaded files attached. Unbound topics and other chats route to Pi as usual; there is no broadcast outside bridge topics.
+
+The append-only `lmk-state.jsonl` stores message, poll and topic mappings. Keep it with the bot state. To cut over from `lmk-tg` **using the same Telegram bot and chat**, stop the old bridge before starting this one. Copy only the mappings from its `state.jsonl` to the new bot state directory (not its polling journal):
+
+```sh
+(umask 077; jq -c 'select(has("tg") or has("poll") or has("topic"))' /path/to/lmk-tg/state.jsonl > /path/to/tg-bot3/lmk-state.jsonl)
+```
+
+Do not run both bridges on the same bot or letmeknow session. The bridge does not replay unfinished deliveries after a restart.
 
 ## Checks
 

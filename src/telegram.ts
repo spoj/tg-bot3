@@ -26,6 +26,7 @@ export type TelegramOptions = {
   allowedPath: string;
   attachmentsDir: string;
   onRestart: () => void;
+  pollConversation?: (id: string) => Conversation | undefined;
 };
 
 function isDirected(message: Message, me: UserFromGetMe): boolean {
@@ -37,12 +38,12 @@ function isDirected(message: Message, me: UserFromGetMe): boolean {
       && text.slice(entity.offset, entity.offset + entity.length).toLowerCase().endsWith(`@${me.username.toLowerCase()}`));
 }
 
-async function download(bot: Bot, token: string, directory: string, message: Message): Promise<Array<Record<string, string>>> {
+async function download(telegram: Telegram, directory: string, message: Message): Promise<Array<Record<string, string>>> {
   const file = message.document ?? message.photo?.at(-1) ?? message.video ?? message.audio ?? message.voice
     ?? message.animation ?? message.video_note ?? message.sticker;
   if (!file) return [];
   try {
-    const info = await bot.api.getFile(file.file_id);
+    const info = await telegram.bot.api.getFile(file.file_id);
     if (!info.file_path) throw new Error("Telegram returned no file_path");
     const candidate = "file_name" in file && file.file_name ? path.basename(file.file_name) : "";
     const name = candidate && candidate !== "." && candidate !== ".." ? candidate : path.basename(info.file_path);
@@ -54,10 +55,9 @@ async function download(bot: Bot, token: string, directory: string, message: Mes
       ...(file.file_unique_id ? [path.basename(file.file_unique_id)] : []),
       name,
     );
-    const response = await fetch(`https://api.telegram.org/file/bot${token}/${info.file_path}`);
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const bytes = await telegram.downloadFile(info.file_path);
     mkdirSync(path.dirname(target), { recursive: true });
-    writeFileSync(target, Buffer.from(await response.arrayBuffer()));
+    writeFileSync(target, bytes);
     return [{ path: target }];
   } catch (error) {
     return [{ failure: String(error) }];
@@ -71,10 +71,12 @@ function localFile(value: unknown): unknown {
 export class Telegram {
   readonly bot: Bot;
   private readonly timeline: Timeline;
+  private readonly token: string;
 
   constructor(options: TelegramOptions) {
-    const { token, timeline, allowedPath, attachmentsDir, onRestart } = options;
+    const { token, timeline, allowedPath, attachmentsDir, onRestart, pollConversation } = options;
     this.timeline = timeline;
+    this.token = token;
     // grammY's default agent bypasses Node's environment proxy support.
     const bot = new Bot(token, { client: { baseFetchConfig: { agent: globalAgent } } });
     this.bot = bot;
@@ -117,13 +119,13 @@ export class Telegram {
       const type = updateType(ctx);
       const payload = (ctx.update as Record<string, any>)[type];
       if (type === "callback_query") void ctx.answerCallbackQuery().catch(() => {});
-      const target = this.conversationOf(ctx, type, payload);
+      const target = this.conversationOf(ctx, type, payload) ?? (type === "poll_answer" ? pollConversation?.(payload.poll_id) : undefined);
       if (!target) return;
       const meta: Record<string, boolean> = { allowed_sender: allowedSender(ctx) };
-      const event: TimelineEvent = { type: `telegram.${type}`, conversation: target, payload, meta };
+      const event: TimelineEvent = { type: `telegram.${type}`, conversation: target, update_id: ctx.update.update_id, payload, meta };
       const message = ctx.msg;
       if (MESSAGE_UPDATES.has(type) && message) {
-        event.attachments = await download(bot, token, attachmentsDir, message);
+        event.attachments = await download(this, attachmentsDir, message);
         meta.private = message.chat.type === "private";
         meta.directed = isDirected(message, bot.botInfo);
         meta.user_content = !SERVICE_FIELDS.some((field) => field in message);
@@ -150,18 +152,27 @@ export class Telegram {
     });
   }
 
-  async send(target: Conversation, request: Record<string, any>): Promise<unknown> {
+  async downloadFile(filePath: string, signal?: AbortSignal): Promise<Buffer> {
+    const response = await fetch(`https://api.telegram.org/file/bot${this.token}/${filePath}`, { signal });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return Buffer.from(await response.arrayBuffer());
+  }
+
+  async send(target: Conversation, request: Record<string, any>, { raw = false, documentName }: { raw?: boolean; documentName?: string } = {}): Promise<unknown> {
     const { method, ...params } = request;
     params.chat_id = target.chat_id;
     if (target.message_thread_id) params.message_thread_id ??= target.message_thread_id;
-    for (const field of MEDIA_FIELDS) if (field in params) params[field] = localFile(params[field]);
-    if (params.media && typeof params.media === "object") {
-      const convert = (item: Record<string, any>) => {
-        const copy: Record<string, any> = { ...item, media: localFile(item.media) };
-        for (const field of ["thumbnail", "cover"]) if (field in copy) copy[field] = localFile(copy[field]);
-        return copy;
-      };
-      params.media = Array.isArray(params.media) ? params.media.map(convert) : convert(params.media);
+    if (documentName !== undefined) params.document = new InputFile(params.document, documentName);
+    if (!raw) {
+      for (const field of MEDIA_FIELDS) if (field in params) params[field] = localFile(params[field]);
+      if (params.media && typeof params.media === "object") {
+        const convert = (item: Record<string, any>) => {
+          const copy: Record<string, any> = { ...item, media: localFile(item.media) };
+          for (const field of ["thumbnail", "cover"]) if (field in copy) copy[field] = localFile(copy[field]);
+          return copy;
+        };
+        params.media = Array.isArray(params.media) ? params.media.map(convert) : convert(params.media);
+      }
     }
     const call = (this.bot.api.raw as Record<string, any>)[method];
     if (typeof call !== "function") throw new Error(`Unknown Telegram Bot API method ${method}`);

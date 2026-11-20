@@ -1,4 +1,5 @@
 import type { Agents } from "./agents.ts";
+import type { Lmk } from "./lmk.ts";
 import type { TimelineRecord } from "./timeline.ts";
 
 const USER_STEER_ABORT_MS = 2 * 60_000;
@@ -14,8 +15,8 @@ export function wakes(record: TimelineRecord): boolean {
   }
 }
 
-/** Delivers a timeline record to its conversation's agent if it should wake it. */
-export function route(agents: Agents, record: TimelineRecord): void {
+export function route(agents: Agents, record: TimelineRecord, lmk?: Lmk): void {
+  if (lmk?.claim(record)) return;
   const target = record.conversation;
   if (!target) return;
   const message = JSON.stringify(record);

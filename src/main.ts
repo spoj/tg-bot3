@@ -4,12 +4,13 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { Agents } from "./agents.ts";
+import { Lmk, type LmkConfig } from "./lmk.ts";
 import { route } from "./router.ts";
 import { Scheduler } from "./scheduler.ts";
 import { Telegram } from "./telegram.ts";
 import { conversationKey, Timeline, type Conversation } from "./timeline.ts";
 
-type Config = { token: string; cwd: string; agentDir?: string; pi?: string };
+type Config = { token: string; cwd: string; agentDir?: string; pi?: string; lmk?: LmkConfig };
 
 const expand = (value: string) => path.resolve(value.replace(/^~(?=\/|$)/, homedir()));
 if (!process.argv[2]) throw new Error("usage: node src/main.ts <state directory>");
@@ -82,13 +83,16 @@ const agents = new Agents({
       .catch((sendError: Error) => console.error("Reporting an agent failure failed", sendError.stack));
   },
 });
+let lmk: Lmk | undefined;
 const telegram = new Telegram({
   token: config.token,
   timeline,
   allowedPath: state("allowed.json"),
   attachmentsDir: state("attachments"),
   onRestart: () => agents.restart(),
+  pollConversation: (id) => lmk?.pollConversation(id),
 });
+if (config.lmk) lmk = new Lmk(config.lmk, stateDir, telegram);
 
 const tools: Record<string, (caller: Conversation, params: any) => unknown> = {
   send: (caller, params) => telegram.send(caller, params),
@@ -121,7 +125,7 @@ const server = net.createServer((socket) => {
 rmSync(state("host.sock"), { force: true });
 server.listen(state("host.sock"));
 
-timeline.subscribe((record) => route(agents, record));
+timeline.subscribe((record) => route(agents, record, lmk));
 
 // grammY errors print the token in request URLs and API objects, so only their stacks are logged.
 let shuttingDown: Promise<void> | undefined;
@@ -130,6 +134,7 @@ function shutdown(code = 0): Promise<void> {
     scheduler.stop();
     await Promise.race([
       Promise.all([
+        lmk?.stop().catch((error: Error) => console.error("Stopping letmeknow failed", error.stack)),
         telegram.bot.stop().catch((error: Error) => console.error("Stopping Telegram polling failed", error.stack)),
         running.catch(() => {}),
       ]),
@@ -146,6 +151,7 @@ process.on("SIGTERM", () => void shutdown());
 // Agents start once Telegram is reachable, so a host failing to connect does not wake them on every restart.
 const running = telegram.run(() => {
   if (shuttingDown) return;
+  lmk?.start();
   agents.recover();
   scheduler.start();
 });
