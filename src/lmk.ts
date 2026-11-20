@@ -4,6 +4,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
+import { setTimeout as sleep } from "node:timers/promises";
 import { promisify } from "node:util";
 import type { Telegram } from "./telegram.ts";
 import { conversation, type TimelineRecord } from "./timeline.ts";
@@ -66,33 +67,40 @@ export class Lmk {
         prefix.push(arg);
       }
     }
-    const listener = spawn(command, [...prefix, "--session", this.config.session, "listen", ...membership], {
-      env: this.env, detached: true, stdio: ["ignore", "pipe", "inherit"],
-    });
-    this.listener = listener;
-    listener.on("error", (error) => this.report(error));
-    this.closed = new Promise((resolve) => listener.once("close", (code, signal) => {
-      this.listener = undefined;
-      this.report(new Error(`listen exited (${code ?? signal})`));
-      resolve();
-    }));
-    const lines = createInterface({ input: listener.stdout })[Symbol.asyncIterator]();
-    this.ready = lines.next().then(({ value, done }) => {
-      if (done) throw new Error("listen ended before ready");
-      const { bin, log } = JSON.parse(value);
-      if (typeof bin !== "string" || !bin) throw new Error("listen did not report its binary");
-      return { bin, log };
-    });
-    void this.ready.then(async ({ log }) => {
-      for await (const line of lines) {
-        if (this.abort.signal.aborted) break;
-        try {
-          await this.fromLmk(JSON.parse(line), log);
-        } catch (error) {
-          this.report(error);
+    const spawnListener = () => {
+      if (this.abort.signal.aborted) return;
+      const listener = spawn(command, [...prefix, "--session", this.config.session, "listen", ...membership], {
+        env: this.env, detached: true, stdio: ["ignore", "pipe", "inherit"],
+      });
+      this.listener = listener;
+      listener.on("error", (error) => this.report(error));
+      this.closed = new Promise((resolve) => listener.once("close", (code, signal) => {
+        if (this.listener === listener) this.listener = undefined;
+        resolve();
+        if (!this.abort.signal.aborted) {
+          this.report(new Error(`listen exited (${code ?? signal}); restarting in 5s`));
+          void sleep(5_000, undefined, { signal: this.abort.signal }).then(() => spawnListener()).catch(() => {});
         }
-      }
-    }).catch((error) => this.report(error));
+      }));
+      const lines = createInterface({ input: listener.stdout })[Symbol.asyncIterator]();
+      this.ready = lines.next().then(({ value, done }) => {
+        if (done) throw new Error("listen ended before ready");
+        const { bin, log } = JSON.parse(value);
+        if (typeof bin !== "string" || !bin) throw new Error("listen did not report its binary");
+        return { bin, log };
+      });
+      void this.ready.then(async ({ log }) => {
+        for await (const line of lines) {
+          if (this.abort.signal.aborted) break;
+          try {
+            await this.fromLmk(JSON.parse(line), log);
+          } catch (error) {
+            this.report(error);
+          }
+        }
+      }).catch((error) => this.report(error));
+    };
+    spawnListener();
   }
 
   async stop(): Promise<void> {
@@ -138,14 +146,43 @@ export class Lmk {
     const member = origin?.fp ?? this.memberOf.get(message.message_thread_id ?? record.conversation.message_thread_id!);
     if (!member) return false;
 
+    const media = written && Boolean(body.document ?? body.photo?.at(-1) ?? body.video ?? body.audio ?? body.voice
+      ?? body.animation ?? body.video_note ?? body.sticker);
+    const said = Boolean(kind === "poll_answer" || kind === "callback_query" || media || (body.text ?? body.caption) !== undefined);
     const update = { update_id: record.update_id, [kind]: body };
-    const args = ["send", ...(origin ? ["--reply-to", origin.lmk] : []), "--to", member];
+    const attachFailure = record.attachments?.find((item: { failure?: string }) => item.failure)?.failure;
     const file = record.attachments?.find((item: { path?: string }) => item.path)?.path;
-    if (file) args.push("--attach", file);
+    const targetConv = conversation(this.config.chat, message.message_thread_id ?? record.conversation.message_thread_id);
     this.outgoing = this.outgoing.then(async () => {
-      const { id } = await this.call(args, JSON.stringify(update));
-      if (written) this.record({ tg: message.message_id, lmk: id });
-    }).catch((error) => this.report(error));
+      if (attachFailure) {
+        await this.telegram.send(targetConv, {
+          method: "sendMessage",
+          text: `letmeknow bridge: failed to download attachment (${attachFailure})`,
+          ...(written ? { reply_parameters: { message_id: message.message_id, allow_sending_without_reply: true } } : {}),
+        }).catch((err) => this.report(err));
+        return;
+      }
+      const attach = file ? ["--attach", file] : [];
+      const addr = said ? [...(origin ? ["--reply-to", origin.lmk] : []), "--to", member] : [];
+      const payload = JSON.stringify(update);
+      let result: Json;
+      try {
+        result = await this.call(["send", ...addr, ...attach], payload);
+      } catch (error) {
+        if (!said || !origin) throw error;
+        // Fallback without --reply-to when the referenced message aged past --carry.
+        result = await this.call(["send", "--to", member, ...attach], payload);
+      }
+      if (written && result.id) this.record({ tg: message.message_id, lmk: result.id });
+    }).catch(async (error) => {
+      this.report(error);
+      if (!said) return;
+      await this.telegram.send(targetConv, {
+        method: "sendMessage",
+        text: `letmeknow bridge failed: ${(error as Error).message.slice(0, 1_000)}`,
+        ...(written ? { reply_parameters: { message_id: message.message_id, allow_sending_without_reply: true } } : {}),
+      }).catch((err) => this.report(err));
+    });
     return true;
   }
 
@@ -208,8 +245,12 @@ export class Lmk {
       if (event.truncated && log && existsSync(log)) {
         const whole = readFileSync(log, "utf8").split("\n").slice(0, -1).findLast((line) => {
           if (!line.includes(id)) return false;
-          const item = JSON.parse(line);
-          return item.type === "message" && item.id === id && (!event.group || item.group === event.group);
+          try {
+            const item = JSON.parse(line);
+            return item.type === "message" && item.id === id && (!event.group || item.group === event.group);
+          } catch {
+            return false;
+          }
         });
         if (whole) content = JSON.parse(whole).content;
       }

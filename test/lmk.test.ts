@@ -156,7 +156,10 @@ test("only lmk-bound topics and tracked messages or polls claim Telegram updates
   assert.deepEqual(calls[0].args.slice(0, 3), ["--to", FP, "--attach"]);
   assert.deepEqual([calls[0].name, calls[0].file], ["user.txt", "outbound file"]);
   assert.deepEqual(calls.slice(1).map((call) => call.args), [
-    ...Array(3).fill(["--reply-to", "tracked", "--to", FP, "-"]), ["--reply-to", "poll", "--to", FP, "-"],
+    ["--reply-to", "tracked", "--to", FP, "-"],
+    ["--reply-to", "tracked", "--to", FP, "-"],
+    ["-"],
+    ["--reply-to", "poll", "--to", FP, "-"],
   ]);
   const mappings = await wait("lmk-state.jsonl", 5);
   assert.deepEqual(mappings.slice(3), [{ tg: 100, lmk: calls[0].id }, { tg: 106, lmk: calls[1].id }]);
