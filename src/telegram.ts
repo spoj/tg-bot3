@@ -11,7 +11,7 @@ const UPDATES = [
   "poll_answer", "message_reaction", "my_chat_member", "chat_join_request",
 ] as const;
 const MESSAGE_UPDATES = new Set(["message", "edited_message", "channel_post", "edited_channel_post"]);
-const MEDIA_FIELDS = ["photo", "audio", "video", "animation", "voice", "video_note", "document", "sticker", "thumbnail", "cover"];
+export const MEDIA_FIELDS = ["photo", "audio", "video", "animation", "voice", "video_note", "document", "sticker", "thumbnail", "cover"];
 const SERVICE_FIELDS = [
   "forum_topic_created", "forum_topic_closed", "forum_topic_reopened", "forum_topic_edited",
   "general_forum_topic_hidden", "general_forum_topic_unhidden", "new_chat_members", "left_chat_member",
@@ -25,7 +25,7 @@ export type TelegramOptions = {
   timeline: Timeline;
   allowedPath: string;
   attachmentsDir: string;
-  onRestart: () => void;
+  onNew: (target: Conversation) => Promise<void> | void;
   pollConversation?: (id: string) => Conversation | undefined;
 };
 
@@ -74,7 +74,7 @@ export class Telegram {
   private readonly token: string;
 
   constructor(options: TelegramOptions) {
-    const { token, timeline, allowedPath, attachmentsDir, onRestart, pollConversation } = options;
+    const { token, timeline, allowedPath, attachmentsDir, onNew, pollConversation } = options;
     this.timeline = timeline;
     this.token = token;
     // grammY's default agent bypasses Node's environment proxy support.
@@ -109,10 +109,11 @@ export class Telegram {
       });
     });
 
-    bot.command("restart", async (ctx, next) => {
-      if (!allowedSender(ctx)) return next();
-      onRestart();
-      await ctx.reply("Restarting agents. Busy ones are stopped and resumed in a fresh session; the rest start fresh on their next message.");
+    bot.command("new", async (ctx, next) => {
+      if (!allowedSender(ctx) || !ctx.chat) return next();
+      const target = conversation(ctx.chat.id, ctx.msg?.is_topic_message ? ctx.msg.message_thread_id : undefined);
+      await onNew(target);
+      await ctx.reply("Session reset for this conversation. The next message will start a fresh Pi session.");
     });
 
     bot.use(async (ctx) => {
@@ -142,7 +143,7 @@ export class Telegram {
   }
 
   async run(onStart: () => void): Promise<void> {
-    await this.bot.api.setMyCommands([{ command: "restart", description: "Restart all agents" }]);
+    await this.bot.api.setMyCommands([{ command: "new", description: "Start a fresh Pi session in this conversation" }]);
     await this.bot.start({
       allowed_updates: UPDATES,
       onStart: (me) => {
@@ -158,11 +159,10 @@ export class Telegram {
     return Buffer.from(await response.arrayBuffer());
   }
 
-  async send(target: Conversation, request: Record<string, any>, { raw = false, documentName }: { raw?: boolean; documentName?: string } = {}): Promise<unknown> {
+  async send(target: Conversation, request: Record<string, any>, { raw = false }: { raw?: boolean } = {}): Promise<unknown> {
     const { method, ...params } = request;
     params.chat_id = target.chat_id;
     if (target.message_thread_id) params.message_thread_id ??= target.message_thread_id;
-    if (documentName !== undefined) params.document = new InputFile(params.document, documentName);
     if (!raw) {
       for (const field of MEDIA_FIELDS) if (field in params) params[field] = localFile(params[field]);
       if (params.media && typeof params.media === "object") {
@@ -182,7 +182,7 @@ export class Telegram {
         this.timeline.publish({
           type: "telegram.sent",
           conversation: conversation(target.chat_id, typeof params.message_thread_id === "number" ? params.message_thread_id : undefined),
-          request,
+          request: sanitizeRequest(request),
           response,
         });
         return response;
@@ -210,6 +210,17 @@ export class Telegram {
     }
     return conversation(chatId, ctx.msg?.is_topic_message ? ctx.msg.message_thread_id : undefined);
   }
+}
+
+function sanitizeRequest(value: unknown): unknown {
+  if (value instanceof InputFile) return { file: value.filename ?? "upload" };
+  if (Array.isArray(value)) return value.map(sanitizeRequest);
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value)) out[k] = sanitizeRequest(v);
+    return out;
+  }
+  return value;
 }
 
 function updateType(ctx: Context): string {

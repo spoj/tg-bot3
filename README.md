@@ -1,73 +1,54 @@
 # tg-bot3
 
-Telegram front end for [Pi](https://github.com/earendil-works/pi). Each Telegram conversation (chat, or forum topic) gets its own `pi --mode rpc` process, started on demand in a working directory you choose with your normal Pi setup: settings, credentials, extensions, `AGENTS.md`. The bot keeps everything it owns in its state directory. The host adds its tools, a short runtime prompt, and the bot's own `AGENTS.md`.
+Unified multi-chat Telegram gateway for [Pi](https://github.com/earendil-works/pi) over [letmeknow](https://letmeknow.dev) and `hc` (`herdr-core`).
 
-There is no sandbox. Agents run as your user with your permissions; only users in `allowed.json` can wake them.
+Every Telegram conversation `(chat_id, message_thread_id)` maps 1:1 to a `letmeknow` member fingerprint. Independently launched Pis anywhere in your owner group talk through the same gateway as Pis spawned on demand via `hc` in your normal interactive Pi setup (`~/.pi/agent/sessions/`, attachable via `hc attach` / `hcm`, surviving bot restarts).
 
 ## Setup
 
-Requires Node.js 24+ and `pi` on `PATH`.
+Requires Node.js 24+, `pi` (with `pi-letmeknow`), `hc`, and `letmeknow` 0.26+.
 
-```sh
-pnpm install
-mkdir -p -m700 ~/notes/bot
-echo '{"token": "<BOT_TOKEN>", "cwd": "~"}' > ~/notes/bot/config.json
-chmod 600 ~/notes/bot/config.json
-echo '[<your chat id>]' > ~/notes/bot/allowed.json
-node src/main.ts ~/notes/bot
-```
-
-If the state directory is in a Git repo, ignore `config.json`, `busy.json`, `host.sock`, `*.tmp`, and `sessions/` there.
-
-`config.json`:
-
-| Key | Default | Meaning |
-|---|---|---|
-| `token` | required | Bot token |
-| `cwd` | required | Agent working directory |
-| `agentDir` | Pi's default (`~/.pi/agent`) | Sets `PI_CODING_AGENT_DIR` for agents |
-| `pi` | `pi` | Pi command |
-| `lmk` | disabled | Optional [letmeknow bridge](#letmeknow-bridge) |
-
-Paths are absolute; `~` expands to your home directory.
-
-Agents load Pi's normal context files from the agent directory, the working directory, and its parents. The host also appends `AGENTS.md` from the state directory when present: put this bot's instructions there.
-
-Run one process per bot, each with its own state directory. Bots may share an agent working directory. `deploy/tg-bot3@.service` is a systemd user template: `tg-bot3@notes` keeps its state in `~/notes/bot/`.
-
-`allowed.json` lists user and chat IDs. Private chats of listed users are recorded. A listed group or channel is recorded in full only while a listed user is one of its admins (checked on every update); otherwise it is ignored. Records carry `meta.allowed_sender`, and only records from listed users can wake an agent. Other updates are dropped; the first per chat (or chatless sender) and process lifetime is recorded as `telegram.access_request` with IDs and username only, so an agent can add them when you approve.
-
-## How it works
-
-Files named below are in the state directory.
-
-- **Timeline** (`timeline.jsonl`): every Telegram update, send, schedule change, steer, and annotation, one JSON record per line with a monotonic `seq`. Agents read it as shared memory. Incoming files go to `attachments/<chat>/<message>/`.
-- **Waking**: from listed users, private messages, group messages that mention or reply to the bot, button presses, and group additions are delivered to the conversation's agent as the raw record.
-- **Steering**: a user message arriving while the agent is busy is queued as a Pi steer; if the agent has not picked it up within two minutes, the host takes the queued messages back, aborts the run, and prompts with them. Scheduled prompts are queued as follow-ups.
-- **Host tools** (`extensions/host-tools.ts`, loaded with `-e`): `send` (raw Bot API call into the agent's own conversation; local file paths upload), `annotate`, `steer_conversation`, and `schedule_add|replace|remove|take`. They reach the host over `host.sock`.
-- **Schedules** (`schedules.json`): hourly, daily, weekly, or one-off; due schedules wake their owning conversation.
-- **Lifecycle**: agents exit after one idle hour; `/restart` restarts all of them, killing any still busy after five seconds. A new process starts a fresh Pi session in `sessions/`, named `telegram <chat_id>:<thread_id>`. An agent stopped mid-run, by `/restart` or by the host stopping, is succeeded by a fresh one woken with an `agent_interrupted` record naming the stopped session; `busy.json` carries busy agents' sessions across host restarts. A failed run is reported in its chat as `Agent failed: …`.
-
-## letmeknow bridge
-
-To bridge a [letmeknow](https://letmeknow.dev) session into a chat with Telegram topics, add this to `config.json`:
+`config.json` (in the state directory, mode `0600`):
 
 ```json
-"lmk": { "session": "<session fingerprint>", "letmeknow": "npx -y @letmeknow/cli@0.26", "chat": -1001234567890, "user": 123456789 }
+{
+  "token": "<BOT_TOKEN>",
+  "cwd": "~",
+  "lmk": {
+    "letmeknow": "npx -y @letmeknow/cli@0.26",
+    "owner": {
+      "session": "<owner bridge fp>",
+      "group": "<owner group id>",
+      "chat": 123456789,
+      "user": 123456789
+    },
+    "local": {
+      "session": "<local-only bridge fp>",
+      "group": "<local-only group id>"
+    }
+  }
+}
 ```
 
-Add the chat and user to `allowed.json`. For a private chat, both IDs are the user's ID and the bot needs Threaded Mode enabled in BotFather. In a forum group, the bot needs permission to manage topics. Use a session in a trusted group: members can send raw Bot API calls through the bot.
+Optional keys: `agentDir`, `pi` (default `pi`), `hc` (default `hc`), `idleMs` (default `3600000`, 1h).
 
-- Incoming text and files go to the sender's fingerprint topic, created on demand. A `*.json` attachment is a Bot API request instead; it may specify `message_thread_id` (use `null` for no thread). The bridge fixes `chat_id` to the configured chat, does not upload host paths from JSON requests, and reserves polling and webhook management for the bot. Results go to the letmeknow log, with a file attached for `getFile`; errors come back as replies. Bot API calls also appear in `timeline.jsonl`.
-- Only the configured user's updates in bridge-bound topics, or replies, button presses, reactions and poll answers tied to tracked bridge messages, go to letmeknow. They go to the relevant member as raw Telegram update JSON, with downloaded files attached. Unbound topics and other chats route to Pi as usual; there is no broadcast outside bridge topics.
+- **Isolation:** `lmk.owner` serves the owner's chat and all independent Pis in the owner group. `lmk.local` serves all other `allowed.json` chats (e.g. family/groups) in a separate machine-local `letmeknow` group so non-owner traffic never reaches other devices.
+- **`allowed.json`:** array of allowed user and chat IDs. Private chats of listed users are admitted; listed groups/channels are admitted only while a listed user is an admin. Unlisted senders are logged once per process as `telegram.access_request`.
 
-The append-only `lmk-state.jsonl` stores message, poll and topic mappings. Keep it with the bot state. To cut over from `lmk-tg` **using the same Telegram bot and chat**, stop the old bridge before starting this one. Copy only the mappings from its `state.jsonl` to the new bot state directory (not its polling journal):
+## Agent wire contract
 
-```sh
-(umask 077; jq -c 'select(has("tg") or has("poll") or has("topic"))' /path/to/lmk-tg/state.jsonl > /path/to/tg-bot3/lmk-state.jsonl)
-```
+Agents send to the bridge's `letmeknow` session fingerprint:
 
-Do not run both bridges on the same bot or letmeknow session. The bridge does not replay unfinished deliveries after a restart.
+- **Plain text:** sent as `sendMessage` with `parse_mode: "HTML"`, retrying once as plain text on Telegram entity-parse errors. Silent on success.
+- **File (`--attach /path/to/file`):** auto-selects `sendPhoto` (`.jpg/.png/.webp`), `sendVoice` (`.ogg/.opus`), `sendAudio`, `sendVideo`, or `sendDocument` (including `.json`), with `sendDocument` fallback. Text ≤ 1024 chars becomes the HTML caption. Silent on success.
+- **Explicit Bot API call (`tg: { ... }`):** prefix message content with `tg: ` followed by a JSON object `{"method": "...", ...}`. Locked to the sender's bound `chat_id` (no cross-chat overrides); `message_thread_id` may target another topic or `null` within the bound chat without stealing that topic's reply binding. Use `"attach://file"` with `--attach` to upload a file in the same call (arbitrary host paths are never uploaded from JSON). Returns a correlated `{ request, result }` reply (and attached bytes for `getFile`).
+
+## Lifecycle & host socket
+
+- **Spawn / resume:** inbound messages (or `wake`) for an unbound or reaped conversation launch/resume `pi --session-id <uuid>` via `hc run --bg --no-parent --outlive-parent` with `PI_LETMEKNOW_JOIN`, `PI_LETMEKNOW_ATTACH=""`, and `PI_LETMEKNOW_READY_FILE`. State persists in `lmk-state.jsonl` (mode `0600`).
+- **Idle reap:** bot-owned `hc` terminals (labeled `owner=tg-bot3`) idle for `idleMs` with status `idle`/`done`, no `hold` label, no active monitors, and no live `hc` children are killed and removed; the next message resumes the same Pi session history. Independently launched Pis are never reaped.
+- **`/new`:** kills any bot-owned terminal for that conversation and unbinds it so the next message starts a fresh Pi session.
+- **`host.sock` (mode `0600`):** minimal local Unix socket for scheduled jobs (`~/jobs/tg_notify.py`) exposing `send` (logs to `timeline.jsonl`, wakes no Pi; replies route to the topic's current binding) and `wake` (wakes/resumes the topic's Pi).
 
 ## Checks
 

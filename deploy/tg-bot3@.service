@@ -1,19 +1,17 @@
 # systemd user template: copy to ~/.config/systemd/user/, then
 #   systemctl --user enable --now tg-bot3@<name>
-# Instance <name> keeps its state in ~/<name>/bot; config.json there sets the agents' working directory.
+# Instance <name> keeps its state in ~/<name>/bot; config.json there sets the bridge and hc launch options.
 [Unit]
-Description=tg-bot3 Telegram agent (%i)
+Description=tg-bot3 Telegram gateway (%i)
 
 [Service]
 WorkingDirectory=%h/tg-bot3
 ExecStart=/usr/bin/env node src/main.ts %h/%i/bot
-# pi and the tools agents use must be on PATH.
 Environment=PATH=%h/.pi/agent/bin:%h/.local/bin:%h/.bun/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
 Restart=on-failure
 RestartSec=5s
-# The host stops its agents itself and keeps busy ones in busy.json; whatever remains dies with it.
 KillMode=mixed
-TimeoutStopSec=20s
+TimeoutStopSec=15s
 
 [Install]
 WantedBy=default.target

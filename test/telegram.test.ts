@@ -12,8 +12,8 @@ function setup() {
   const dir = mkdtempSync(path.join(tmpdir(), "tg-bot3-"));
   writeFileSync(path.join(dir, "allowed.json"), "[10, -20, -21]");
   const timeline = new Timeline(path.join(dir, "timeline.jsonl"));
-  let restarts = 0;
-  const telegram = new Telegram({ token: "1:x", timeline, allowedPath: path.join(dir, "allowed.json"), attachmentsDir: dir, onRestart: () => restarts++ });
+  let resets = 0;
+  const telegram = new Telegram({ token: "1:x", timeline, allowedPath: path.join(dir, "allowed.json"), attachmentsDir: dir, onNew: () => { resets++; } });
   telegram.bot.botInfo = { id: 1, is_bot: true, first_name: "Bot", username: "the_bot" } as any;
   const calls: Array<[string, any]> = [];
   telegram.bot.api.config.use(async (_prev, method, payload) => {
@@ -21,7 +21,7 @@ function setup() {
     if (method === "getChatAdministrators") return { ok: true, result: [{ status: "creator", user: user((payload as any).chat_id === -20 ? 10 : 40) }] } as any;
     return { ok: true, result: method === "sendPoll" ? { message_id: 99, poll: { id: "p1" } } : { message_id: 50 } } as any;
   });
-  return { dir, timeline, telegram, calls, restarts: () => restarts };
+  return { dir, timeline, telegram, calls, resets: () => resets };
 }
 
 const chat = (id: number) => id > 0 ? { id, type: "private", first_name: "U" } : { id, type: "supergroup", title: "G", is_forum: true };
@@ -90,14 +90,14 @@ test("update failures are logged without the token", async () => {
   assert.doesNotMatch(logged.join("\n"), /1:x/);
 });
 
-test("/restart restarts agents without recording", async () => {
-  const { timeline, telegram, calls, restarts } = setup();
-  await telegram.bot.handleUpdate({ update_id: 7, message: message(10, { text: "/restart", entities: [{ type: "bot_command", offset: 0, length: 8 }] }) } as any);
-  assert.equal(restarts(), 1);
+test("/new resets the conversation without recording", async () => {
+  const { timeline, telegram, calls, resets } = setup();
+  await telegram.bot.handleUpdate({ update_id: 7, message: message(10, { text: "/new", entities: [{ type: "bot_command", offset: 0, length: 4 }] }) } as any);
+  assert.equal(resets(), 1);
   assert.equal(calls[0]![0], "sendMessage");
   assert.equal(timeline.read().length, 0);
-  await telegram.bot.handleUpdate({ update_id: 8, message: message(-20, { from: user(40), text: "/restart", entities: [{ type: "bot_command", offset: 0, length: 8 }] }) } as any);
-  assert.equal(restarts(), 1);
+  await telegram.bot.handleUpdate({ update_id: 8, message: message(-20, { from: user(40), text: "/new", entities: [{ type: "bot_command", offset: 0, length: 4 }] }) } as any);
+  assert.equal(resets(), 1);
   assert.equal(timeline.read().at(-1)!.meta.allowed_sender, false);
 });
 
