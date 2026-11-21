@@ -27,6 +27,8 @@ export type BridgeConfig = {
   idleMs?: number;
   reapIntervalMs?: number;
   readyTimeoutMs?: number;
+  typingDelayMs?: number;
+  typingIntervalMs?: number;
 };
 
 type Binding = {
@@ -58,6 +60,107 @@ const POLLING_METHODS = new Set(["getUpdates", "setWebhook", "deleteWebhook", "l
 const DEFAULT_IDLE_MS = 60 * 60_000;
 const DEFAULT_REAP_INTERVAL_MS = 5 * 60_000;
 const DEFAULT_READY_TIMEOUT_MS = 90_000;
+const DEFAULT_TYPING_DELAY_MS = 3_000;
+const DEFAULT_TYPING_INTERVAL_MS = 4_500;
+const HTML_TAG_RE = /<\/?([a-zA-Z][a-zA-Z0-9-]*)(?:\s[^<>]*)?\/?>/g;
+
+export function splitHtml(html: string, maxLen = 4096): string[] {
+  if (html.length <= maxLen) return [html];
+  const stack: Array<{ open: string; close: string; name: string }> = [];
+  const out: string[] = [];
+  let buf = "";
+  let hasContent = false;
+
+  const closingLen = () => stack.reduce((sum, tag) => sum + tag.close.length, 0);
+  const openTags = () => stack.map((tag) => tag.open).join("");
+  const closeTags = () => stack.slice().reverse().map((tag) => tag.close).join("");
+  const flush = () => {
+    if (hasContent) out.push(buf + closeTags());
+    buf = openTags();
+    hasContent = false;
+  };
+
+  const appendText = (raw: string) => {
+    let text = raw;
+    while (text.length > 0) {
+      let avail = maxLen - buf.length - closingLen();
+      if (avail <= 0) {
+        if (hasContent) flush();
+        avail = maxLen - buf.length - closingLen();
+        if (avail <= 0) {
+          stack.length = 0;
+          buf = "";
+          avail = maxLen;
+        }
+      }
+      if (text.length <= avail) {
+        buf += text;
+        if (/\S/.test(text)) hasContent = true;
+        return;
+      }
+      const slice = text.slice(0, avail);
+      let cut = -1;
+      const para = slice.lastIndexOf("\n\n");
+      if (para > 0 && /\S/.test(slice.slice(0, para))) cut = para + 2 <= avail ? para + 2 : para + 1;
+      else {
+        const nl = slice.lastIndexOf("\n");
+        if (nl > 0 && /\S/.test(slice.slice(0, nl))) cut = nl + 1;
+        else {
+          const sp = slice.lastIndexOf(" ");
+          if (sp > 0 && /\S/.test(slice.slice(0, sp))) cut = sp + 1;
+        }
+      }
+      if (cut <= 0) {
+        const fullAvail = maxLen - openTags().length - closingLen();
+        if (hasContent && text.length <= fullAvail) {
+          flush();
+          continue;
+        }
+        cut = avail;
+        const entity = text.slice(0, cut).match(/&[a-zA-Z0-9#]*$/);
+        if (entity && /^[a-zA-Z0-9#]*;/.test(text.slice(cut)) && cut - entity[0].length > 0) {
+          cut -= entity[0].length;
+        }
+        const code = text.charCodeAt(cut - 1);
+        if (code >= 0xD800 && code <= 0xDBFF && cut > 1) cut--;
+      }
+      const part = text.slice(0, cut);
+      buf += part;
+      if (/\S/.test(part)) hasContent = true;
+      text = text.slice(cut);
+      flush();
+    }
+  };
+
+  let last = 0;
+  for (const match of html.matchAll(HTML_TAG_RE)) {
+    const idx = match.index!;
+    if (idx > last) appendText(html.slice(last, idx));
+    const token = match[0];
+    const name = match[1]!.toLowerCase();
+    last = idx + token.length;
+
+    if (token.startsWith("</")) {
+      const pos = stack.findLastIndex((tag) => tag.name === name);
+      if (pos >= 0) stack.splice(pos, 1);
+      else if (hasContent && buf.length + token.length + closingLen() > maxLen) flush();
+      buf += token;
+    } else if (token.endsWith("/>")) {
+      if (hasContent && buf.length + token.length + closingLen() > maxLen) flush();
+      buf += token;
+    } else {
+      const close = `</${name}>`;
+      if (hasContent && buf.length + token.length + close.length + closingLen() >= maxLen) flush();
+      if (buf.length + token.length + close.length + closingLen() < maxLen) {
+        stack.push({ open: token, close, name });
+      }
+      buf += token;
+    }
+  }
+  if (last < html.length) appendText(html.slice(last));
+  if (hasContent) out.push(buf + closeTags());
+  return out.length ? out : [html];
+}
 
 function parseCommand(spec: string): { command: string; prefix: string[]; shared: string[]; membership: string[] } {
   const [command, ...args] = (spec.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) ?? [])
@@ -101,7 +204,7 @@ function isEntityParseError(error: unknown): boolean {
 function mediaSpecFor(filename: string): { method: string; field: string; fallbackDoc: boolean } {
   const ext = path.extname(filename).toLowerCase();
   if ([".jpg", ".jpeg", ".png", ".webp"].includes(ext)) return { method: "sendPhoto", field: "photo", fallbackDoc: true };
-  if ([".ogg", ".opus"].includes(ext)) return { method: "sendVoice", field: "voice", fallbackDoc: true };
+  if ([".ogg", ".oga", ".opus"].includes(ext)) return { method: "sendVoice", field: "voice", fallbackDoc: true };
   if ([".mp3", ".m4a", ".flac", ".wav"].includes(ext)) return { method: "sendAudio", field: "audio", fallbackDoc: true };
   if ([".mp4", ".mov"].includes(ext)) return { method: "sendVideo", field: "video", fallbackDoc: true };
   return { method: "sendDocument", field: "document", fallbackDoc: false };
@@ -245,6 +348,7 @@ export class Bridge {
   private readonly pollOf = new Map<string, PollEntry>();
   private readonly pending = new Map<number, PendingItem>();
   private readonly queues = new Map<string, Promise<void>>();
+  private readonly typingWatchers = new Map<string, AbortController>();
   private reapTimer?: NodeJS.Timeout;
 
   constructor(config: BridgeConfig, stateDir: string, telegram: Telegram, hc: HcClient) {
@@ -440,6 +544,7 @@ export class Bridge {
         this.record({ chat: item.conv.chat_id, tg: item.tgMessageId, lmk: result.id, scope: item.scope });
       }
       this.record({ delivered: item.seq });
+      if (item.said && binding?.owned && binding.hc) this.watchTyping(item.conv, binding.hc);
     } catch (error) {
       this.report(error);
       this.record({ delivered: item.seq, error: (error as Error).message });
@@ -450,6 +555,49 @@ export class Bridge {
         ...(item.written && item.tgMessageId ? { reply_parameters: { message_id: item.tgMessageId, allow_sending_without_reply: true } } : {}),
       }).catch((err) => this.report(err));
     }
+  }
+
+  private stopTyping(key: string): void {
+    const prev = this.typingWatchers.get(key);
+    if (prev) {
+      prev.abort();
+      this.typingWatchers.delete(key);
+    }
+  }
+
+  private watchTyping(conv: Conversation, hcAddr: string): void {
+    const intervalMs = this.config.typingIntervalMs ?? DEFAULT_TYPING_INTERVAL_MS;
+    if (intervalMs <= 0) return;
+    const delayMs = this.config.typingDelayMs ?? DEFAULT_TYPING_DELAY_MS;
+    const key = conversationKey(conv);
+    this.stopTyping(key);
+    const localAbort = new AbortController();
+    this.typingWatchers.set(key, localAbort);
+    const signal = AbortSignal.any([this.abort.signal, localAbort.signal]);
+    const isWorking = async (): Promise<boolean> => {
+      const binding = this.bindingOfConv.get(key);
+      if (!binding?.owned || binding.hc !== hcAddr) return false;
+      const term = await this.hc.get(hcAddr).catch(() => null);
+      return term?.state === "live" && term.status?.state === "working";
+    };
+    void (async () => {
+      try {
+        let working = await isWorking();
+        if (!working && delayMs > 0) {
+          await sleep(delayMs, undefined, { signal });
+          working = await isWorking();
+        }
+        while (working && !signal.aborted) {
+          await this.telegram.sendTyping(conv);
+          await sleep(intervalMs, undefined, { signal });
+          working = await isWorking();
+        }
+      } catch {
+        // Aborted by shutdown, unbind, reap, or superseded by a newer delivery.
+      } finally {
+        if (this.typingWatchers.get(key) === localAbort) this.typingWatchers.delete(key);
+      }
+    })();
   }
 
   private async resolveRecipient(conv: Conversation, scope: Scope, originFp?: string): Promise<string> {
@@ -677,7 +825,7 @@ Manage reminders and schedules with: python3 /home/spoj/jobs/remind.py add|list|
       if (attachment) {
         const useCaption = Boolean(trimmed) && trimmed.length <= 1024;
         if (trimmed && !useCaption) {
-          for (const chunk of content.match(/[^]{1,4096}/gu) ?? []) {
+          for (const chunk of splitHtml(content)) {
             if (!/\S/.test(chunk)) continue;
             const res = await sendOrdinary({ method: "sendMessage", text: chunk, parse_mode: "HTML" });
             this.recordTelegramResult(allowedChat, scope, id, from, res);
@@ -698,7 +846,7 @@ Manage reminders and schedules with: python3 /home/spoj/jobs/remind.py add|list|
         }
         this.recordTelegramResult(allowedChat, scope, id, from, res);
       } else {
-        const chunks = (content.match(/[^]{1,4096}/gu) ?? []).filter((text) => /\S/.test(text));
+        const chunks = splitHtml(content).filter((text) => /\S/.test(text));
         if (!chunks.length) chunks.push(content);
         for (const text of chunks) {
           const res = await sendOrdinary({ method: "sendMessage", text, parse_mode: "HTML" });
@@ -739,6 +887,7 @@ Manage reminders and schedules with: python3 /home/spoj/jobs/remind.py add|list|
     }
     if ("unbind" in entry) {
       const key = conversationKey(entry.unbind);
+      this.stopTyping(key);
       const prev = this.bindingOfConv.get(key);
       if (prev) {
         this.bindingOfConv.delete(key);
@@ -748,7 +897,9 @@ Manage reminders and schedules with: python3 /home/spoj/jobs/remind.py add|list|
       return;
     }
     if ("reaped" in entry) {
-      const prev = this.bindingOfConv.get(conversationKey(entry.reaped));
+      const key = conversationKey(entry.reaped);
+      this.stopTyping(key);
+      const prev = this.bindingOfConv.get(key);
       if (prev && (!entry.hc || prev.hc === entry.hc)) prev.hc = undefined;
       return;
     }

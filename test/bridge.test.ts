@@ -5,7 +5,7 @@ import path from "node:path";
 import test, { type TestContext } from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
 import { GrammyError, InputFile } from "grammy";
-import { Bridge } from "../src/bridge.ts";
+import { Bridge, splitHtml } from "../src/bridge.ts";
 import type { HcClient, HcTerminal, SpawnSpec } from "../src/hc.ts";
 import { Telegram } from "../src/telegram.ts";
 import { Timeline } from "../src/timeline.ts";
@@ -56,7 +56,15 @@ class FakeHc implements HcClient {
   }
 }
 
-function setup(t: TestContext, { entries = [], apiHook }: { entries?: object[]; apiHook?: (method: string, params: any) => any } = {}) {
+function setup(
+  t: TestContext,
+  {
+    entries = [],
+    apiHook,
+    typingDelayMs = 0,
+    typingIntervalMs = 0,
+  }: { entries?: object[]; apiHook?: (method: string, params: any) => any; typingDelayMs?: number; typingIntervalMs?: number } = {},
+) {
   const dir = mkdtempSync(path.join(tmpdir(), "tg-bot3-bridge-"));
   const state = (file: string) => path.join(dir, file);
   const read = (file: string): any[] => existsSync(state(file))
@@ -107,6 +115,8 @@ function setup(t: TestContext, { entries = [], apiHook }: { entries?: object[]; 
       idleMs: 1_000,
       reapIntervalMs: 0,
       readyTimeoutMs: 5_000,
+      typingDelayMs,
+      typingIntervalMs,
     },
     dir,
     telegram,
@@ -167,24 +177,27 @@ test("ordinary text defaults to HTML, falls back to plain text only on entity pa
   assert.equal(statSync(state("lmk-state.jsonl")).mode & 0o777, 0o600);
 });
 
-test("plain --attach selects media method (including .ogg -> sendVoice, .json -> sendDocument) and uses short text as HTML caption", async (t) => {
+test("plain --attach selects media method (including .ogg/.oga -> sendVoice, .json -> sendDocument) and uses short text as HTML caption", async (t) => {
   const { lmkEvent, attachment, waitReq, requests } = setup(t, {
     entries: [{ topic: 9, fp: REMOTE_FP }],
   });
   lmkEvent("owner", "a1", REMOTE_FP, { content: "<b>chart</b>", attachment: attachment("chart.png", "PNG") });
   lmkEvent("owner", "a2", REMOTE_FP, { content: "", attachment: attachment("note.ogg", "OGG") });
-  lmkEvent("owner", "a3", REMOTE_FP, { content: "config", attachment: attachment("data.json", '{"method":"getUpdates"}') });
-  await waitReq(3);
+  lmkEvent("owner", "a3", REMOTE_FP, { content: "", attachment: attachment("voice.oga", "OGA") });
+  lmkEvent("owner", "a4", REMOTE_FP, { content: "config", attachment: attachment("data.json", '{"method":"getUpdates"}') });
+  await waitReq(4);
   assert.equal(requests[0]![0], "sendPhoto");
   assert.equal(requests[0]![1].caption, "<b>chart</b>");
   assert.equal(requests[0]![1].parse_mode, "HTML");
   assert.ok(requests[0]![1].photo instanceof InputFile);
   assert.equal(requests[1]![0], "sendVoice");
   assert.ok(requests[1]![1].voice instanceof InputFile);
-  assert.equal(requests[2]![0], "sendDocument");
-  assert.equal(requests[2]![1].caption, "config");
-  assert.ok(requests[2]![1].document instanceof InputFile);
-  assert.equal(requests[2]![1].document.filename, "data.json");
+  assert.equal(requests[2]![0], "sendVoice");
+  assert.ok(requests[2]![1].voice instanceof InputFile);
+  assert.equal(requests[3]![0], "sendDocument");
+  assert.equal(requests[3]![1].caption, "config");
+  assert.ok(requests[3]![1].document instanceof InputFile);
+  assert.equal(requests[3]![1].document.filename, "data.json");
 });
 
 test("explicit 'tg: ' Bot API calls support attach://, block cross-chat overrides, protect foreign topic bindings, and return correlated replies", async (t) => {
@@ -328,4 +341,88 @@ test("pending inbound item persisted in lmk-state.jsonl replays on bridge restar
   const calls = await wait("owner-calls.jsonl", 1);
   assert.equal(hc.spawns.length, 1);
   assert.equal(JSON.parse(calls[0].body).message.text, "recovered");
+});
+
+test("splitHtml keeps tags, entities, and surrogate pairs intact across chunks", () => {
+  assert.deepEqual(splitHtml("<b>short</b>", 4096), ["<b>short</b>"]);
+
+  const code = `<pre><code class="language-ts">${"const x = 1;\n".repeat(10)}</code></pre>`;
+  const codeChunks = splitHtml(code, 80);
+  assert.ok(codeChunks.length >= 2);
+  for (const chunk of codeChunks) {
+    assert.ok(chunk.length <= 80, `chunk exceeded limit: ${chunk.length}`);
+    assert.ok(chunk.startsWith('<pre><code class="language-ts">'));
+    assert.ok(chunk.endsWith("</code></pre>"));
+  }
+  const joinedCode = codeChunks.map((c) => c.slice('<pre><code class="language-ts">'.length, -"</code></pre>".length)).join("");
+  assert.equal(joinedCode, "const x = 1;\n".repeat(10));
+
+  const nested = `<b><i><a href="https://example.com">${"word ".repeat(20)}</a></i></b>`;
+  const nestedChunks = splitHtml(nested, 70);
+  assert.ok(nestedChunks.length >= 2);
+  for (const chunk of nestedChunks) {
+    assert.ok(chunk.length <= 70);
+    assert.ok(chunk.startsWith('<b><i><a href="https://example.com">'));
+    assert.ok(chunk.endsWith("</a></i></b>"));
+  }
+
+  const entities = "aaaaaaa&lt;bbbbbbb&gt;ccccccc";
+  const entityChunks = splitHtml(entities, 10);
+  for (const chunk of entityChunks) {
+    assert.ok(chunk.length <= 10);
+    assert.doesNotMatch(chunk, /&[a-z]*$/);
+  }
+  assert.equal(entityChunks.join(""), entities);
+
+  const emoji = "a".repeat(9) + "😀😀😀";
+  const emojiChunks = splitHtml(emoji, 10);
+  for (const chunk of emojiChunks) assert.ok(chunk.length <= 10);
+  assert.equal(emojiChunks.join(""), emoji);
+});
+
+test("truthful typing indicator polls owned hc terminal while working, skips timeline, and ignores idle/remote sessions", async (t) => {
+  const { telegram, hc, wait, waitReq, requests, read } = setup(t, {
+    entries: [{ topic: 9, fp: REMOTE_FP }],
+    typingDelayMs: 30,
+    typingIntervalMs: 40,
+  });
+
+  // 1. Remote/unowned topic emits no typing indicator.
+  await telegram.bot.handleUpdate({
+    update_id: 1,
+    message: { message_id: 401, date: 0, chat: chat(OWNER_CHAT), from: user(OWNER_USER), is_topic_message: true, message_thread_id: 9, text: "remote ping" },
+  } as any);
+  await wait("owner-calls.jsonl", 1);
+  await sleep(90);
+  assert.equal(requests.filter(([m]) => m === "sendChatAction").length, 0);
+
+  // 2. Owned topic that stays idle emits no typing indicator.
+  await telegram.bot.handleUpdate({
+    update_id: 2,
+    message: { message_id: 402, date: 0, chat: chat(OWNER_CHAT), from: user(OWNER_USER), is_topic_message: true, message_thread_id: 88, text: "quick" },
+  } as any);
+  await wait("owner-calls.jsonl", 2);
+  await sleep(90);
+  assert.equal(requests.filter(([m]) => m === "sendChatAction").length, 0);
+
+  // 3. Owned topic flips to working -> sends typing repeatedly while working, then stops when done.
+  const term = hc.terminals.get("t1")!;
+  await telegram.bot.handleUpdate({
+    update_id: 3,
+    message: { message_id: 403, date: 0, chat: chat(OWNER_CHAT), from: user(OWNER_USER), is_topic_message: true, message_thread_id: 88, text: "slow task" },
+  } as any);
+  await wait("owner-calls.jsonl", 3);
+  term.status = { state: "working" };
+  await waitReq(2);
+  const typingBeforeDone = requests.filter(([m]) => m === "sendChatAction");
+  assert.ok(typingBeforeDone.length >= 2);
+  assert.deepEqual(typingBeforeDone[0], ["sendChatAction", { chat_id: OWNER_CHAT, message_thread_id: 88, action: "typing" }]);
+
+  term.status = { state: "done" };
+  await sleep(100);
+  const countAfterStop = requests.filter(([m]) => m === "sendChatAction").length;
+  await sleep(100);
+  assert.equal(requests.filter(([m]) => m === "sendChatAction").length, countAfterStop);
+  // Typing calls must not pollute timeline.jsonl.
+  assert.equal(read("timeline.jsonl").filter((r) => r.type === "telegram.sent").length, 0);
 });

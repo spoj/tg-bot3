@@ -159,6 +159,12 @@ export class Telegram {
     return Buffer.from(await response.arrayBuffer());
   }
 
+  async sendTyping(target: Conversation): Promise<void> {
+    const params: Record<string, any> = { chat_id: target.chat_id, action: "typing" };
+    if (target.message_thread_id) params.message_thread_id = target.message_thread_id;
+    await this.bot.api.raw.sendChatAction(params as any).catch(() => {});
+  }
+
   async send(target: Conversation, request: Record<string, any>, { raw = false }: { raw?: boolean } = {}): Promise<unknown> {
     const { method, ...params } = request;
     params.chat_id = target.chat_id;

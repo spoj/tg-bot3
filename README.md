@@ -39,14 +39,15 @@ Optional keys: `agentDir`, `pi` (default `pi`), `hc` (default `hc`), `idleMs` (d
 
 Agents send to the bridge's `letmeknow` session fingerprint:
 
-- **Plain text:** sent as `sendMessage` with `parse_mode: "HTML"`, retrying once as plain text on Telegram entity-parse errors. Silent on success.
-- **File (`--attach /path/to/file`):** auto-selects `sendPhoto` (`.jpg/.png/.webp`), `sendVoice` (`.ogg/.opus`), `sendAudio`, `sendVideo`, or `sendDocument` (including `.json`), with `sendDocument` fallback. Text ≤ 1024 chars becomes the HTML caption. Silent on success.
+- **Plain text:** sent as `sendMessage` with `parse_mode: "HTML"`, HTML-safely chunked at 4096 chars, retrying once as plain text on Telegram entity-parse errors. Silent on success.
+- **File (`--attach /path/to/file`):** auto-selects `sendPhoto` (`.jpg/.png/.webp`), `sendVoice` (`.ogg/.oga/.opus`), `sendAudio`, `sendVideo`, or `sendDocument` (including `.json`), with `sendDocument` fallback. Text ≤ 1024 chars becomes the HTML caption. Silent on success.
 - **Explicit Bot API call (`tg: { ... }`):** prefix message content with `tg: ` followed by a JSON object `{"method": "...", ...}`. Locked to the sender's bound `chat_id` (no cross-chat overrides); `message_thread_id` may target another topic or `null` within the bound chat without stealing that topic's reply binding. Use `"attach://file"` with `--attach` to upload a file in the same call (arbitrary host paths are never uploaded from JSON). Returns a correlated `{ request, result }` reply (and attached bytes for `getFile`).
 
 ## Lifecycle & host socket
 
 - **Spawn / resume:** inbound messages (or `wake`) for an unbound or reaped conversation launch/resume `pi --session-id <uuid>` via `hc run --bg --no-parent --outlive-parent` with `PI_LETMEKNOW_JOIN`, `PI_LETMEKNOW_ATTACH=""`, and `PI_LETMEKNOW_READY_FILE`. State persists in `lmk-state.jsonl` (mode `0600`).
 - **Idle reap:** bot-owned `hc` terminals (labeled `owner=tg-bot3`) idle for `idleMs` with status `idle`/`done`, no `hold` label, no active monitors, and no live `hc` children are killed and removed; the next message resumes the same Pi session history. Independently launched Pis are never reaped.
+- **Typing indicator:** for bot-owned `hc` terminals, inbound deliveries check `hc get` and send `sendChatAction("typing")` every 4.5s only while `status.state === "working"`. Remote/unowned sessions emit no typing indicator.
 - **`/new`:** kills any bot-owned terminal for that conversation and unbinds it so the next message starts a fresh Pi session.
 - **`host.sock` (mode `0600`):** minimal local Unix socket for scheduled jobs (`~/jobs/tg_notify.py`) exposing `send` (logs to `timeline.jsonl`, wakes no Pi; replies route to the topic's current binding) and `wake` (wakes/resumes the topic's Pi).
 
