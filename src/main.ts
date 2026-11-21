@@ -72,7 +72,7 @@ bridge = new Bridge(
     cwd,
     pi: config.pi ?? "pi",
     agentDir: config.agentDir ? expand(config.agentDir) : undefined,
-    botLabel: path.basename(path.dirname(stateDir)) || "default",
+    botLabel: (path.basename(stateDir) === "bot" ? path.basename(path.dirname(stateDir)) : path.basename(stateDir)) || "default",
     idleMs: config.idleMs,
   },
   stateDir,
