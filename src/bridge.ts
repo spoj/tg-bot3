@@ -1,6 +1,6 @@
 import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, rmSync, truncateSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, rmSync, truncateSync, writeFileSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -21,8 +21,7 @@ export type BridgeConfig = {
   owner: OwnerConfig;
   local?: EndpointConfig;
   cwd: string;
-  pi: string;
-  agentDir?: string;
+  agy: string;
   botLabel: string;
   idleMs?: number;
   reapIntervalMs?: number;
@@ -36,7 +35,7 @@ type Binding = {
   fp: string;
   scope: Scope;
   owned: boolean;
-  sessionId?: string;
+  conversationId?: string;
   hc?: string;
   lastActiveMs: number;
 };
@@ -606,7 +605,7 @@ export class Bridge {
       if (byFp?.owned) {
         const alive = byFp.hc ? await this.hc.get(byFp.hc) : null;
         if (alive?.state === "live") return byFp.fp;
-        return this.launchOrResume(byFp.conv, scope, byFp.sessionId ?? randomUUID());
+        return this.launchOrResume(byFp.conv, scope, byFp.conversationId);
       }
       return originFp;
     }
@@ -616,9 +615,9 @@ export class Bridge {
       if (!existing.owned) return existing.fp;
       const alive = existing.hc ? await this.hc.get(existing.hc) : null;
       if (alive?.state === "live") return existing.fp;
-      return this.launchOrResume(conv, scope, existing.sessionId ?? randomUUID());
+      return this.launchOrResume(conv, scope, existing.conversationId);
     }
-    return this.launchOrResume(conv, scope, randomUUID());
+    return this.launchOrResume(conv, scope);
   }
 
   private runtimePrompt(conv: Conversation, scope: Scope): string {
@@ -627,10 +626,11 @@ export class Bridge {
     const threadNote = conv.message_thread_id ? `, message_thread_id ${conv.message_thread_id}` : "";
     return `## Telegram conversation (${key})
 
-You are the Pi agent for Telegram chat_id ${conv.chat_id}${threadNote}.
-Your plain assistant text is not shown in Telegram. Talk to Telegram via the letmeknow tool addressed to bridge session ${endpoint.session}:
-- Text (HTML by default, plain-text fallback on parse error): letmeknow send --to ${endpoint.session} -
-- File/media (photo/voice/audio/video/document auto-selected; text <=1024 chars becomes caption): letmeknow send --to ${endpoint.session} --attach /abs/path -
+You are the Antigravity (AGY) agent for Telegram chat_id ${conv.chat_id}${threadNote}.
+Run \`agy-letmeknow bind\` via \`run_command\` on startup or resume if not yet bound.
+Your plain assistant text is not shown in Telegram. Talk to Telegram via \`run_command\` using \`agy-letmeknow\` addressed to bridge session ${endpoint.session}:
+- Text (HTML by default, plain-text fallback on parse error): agy-letmeknow send --to ${endpoint.session} -
+- File/media (photo/voice/audio/video/document auto-selected; text <=1024 chars becomes caption): agy-letmeknow send --to ${endpoint.session} --attach /abs/path -
 - Explicit Telegram Bot API call (e.g. editForumTopic, sendPoll, inline keyboards, disable_notification): prefix stdin with "tg: " + JSON, e.g. tg: {"method":"editForumTopic","name":"Topic Name"}. Combine with --attach /abs/path using "attach://file" in the media field.
 
 Bot state lives in ${this.stateDir} (timeline.jsonl, attachments/, allowed.json, AGENTS.md).
@@ -639,46 +639,66 @@ Manage reminders and schedules with: python3 /home/spoj/jobs/remind.py add|list|
 `;
   }
 
-  private async launchOrResume(conv: Conversation, scope: Scope, sessionId: string): Promise<string> {
+  private async launchOrResume(conv: Conversation, scope: Scope, conversationId?: string): Promise<string> {
     const endpoint = this.endpoints[scope]!;
     const key = conversationKey(conv);
     mkdirSync(this.readyDir, { recursive: true, mode: 0o700 });
-    const readyFile = path.join(this.readyDir, `${randomUUID()}.json`);
+    const runId = randomUUID();
+    const readyFile = path.join(this.readyDir, `${runId}.json`);
+    const promptFile = path.join(this.readyDir, `${runId}.prompt.md`);
     const agentsMd = path.join(this.stateDir, "AGENTS.md");
-    const argv = [
-      this.config.pi,
-      "--session-id", sessionId,
-      "--name", `tg ${key}`,
-      "--append-system-prompt", this.runtimePrompt(conv, scope),
-      ...(existsSync(agentsMd) ? ["--append-system-prompt", agentsMd] : []),
-    ];
+    const prompt = existsSync(agentsMd)
+      ? `${this.runtimePrompt(conv, scope)}\n${readFileSync(agentsMd, "utf8")}`
+      : this.runtimePrompt(conv, scope);
+    writeFileSync(promptFile, prompt, { mode: 0o600 });
+    const argv = conversationId
+      ? [
+        this.config.agy,
+        "--dangerously-skip-permissions",
+        "--conversation", conversationId,
+        "-i", "Session resumed for Telegram. Run agy-letmeknow bind now and handle incoming Telegram messages.",
+      ]
+      : [
+        this.config.agy,
+        "--dangerously-skip-permissions",
+        "-i", "Session started for Telegram. Run agy-letmeknow bind now and wait for incoming Telegram messages.",
+      ];
     const env: Record<string, string> = {
-      PI_LETMEKNOW_JOIN: endpoint.group,
-      PI_LETMEKNOW_ATTACH: "",
-      PI_LETMEKNOW_READY_FILE: readyFile,
-      ...(this.config.agentDir ? { PI_CODING_AGENT_DIR: this.config.agentDir } : {}),
+      AGY_LETMEKNOW_JOIN: endpoint.group,
+      AGY_LETMEKNOW_ATTACH: "",
+      AGY_LETMEKNOW_READY_FILE: readyFile,
+      AGY_LETMEKNOW_PROMPT_FILE: promptFile,
+      AGY_CLI_OSC7501: "on",
     };
     const hcName = `tg-${String(conv.chat_id).replace("-", "g")}-${conv.message_thread_id ?? 0}`;
-    const addr = await this.hc.spawn({
-      name: hcName,
-      cwd: this.config.cwd,
-      labels: { owner: "tg-bot3", bot: this.config.botLabel, conv: key, scope },
-      env,
-      argv,
-    });
-    const deadline = Date.now() + (this.config.readyTimeoutMs ?? DEFAULT_READY_TIMEOUT_MS);
+    let addr: string | undefined;
     try {
+      addr = await this.hc.spawn({
+        name: hcName,
+        cwd: this.config.cwd,
+        labels: { owner: "tg-bot3", bot: this.config.botLabel, conv: key, scope },
+        env,
+        argv,
+      });
+      const deadline = Date.now() + (this.config.readyTimeoutMs ?? DEFAULT_READY_TIMEOUT_MS);
       let checks = 0;
       while (Date.now() < deadline) {
         this.abort.signal.throwIfAborted();
         if (existsSync(readyFile)) {
-          const receipt = JSON.parse(readFileSync(readyFile, "utf8")) as { fp?: string; groups?: string[]; warnings?: string[]; error?: string };
-          if (receipt.error) throw new Error(`Pi letmeknow startup failed: ${receipt.error}`);
-          if (!receipt.fp) throw new Error("Pi readiness receipt missing fp");
+          const receipt = JSON.parse(readFileSync(readyFile, "utf8")) as {
+            fp?: string;
+            conversationId?: string;
+            groups?: string[];
+            warnings?: string[];
+            error?: string;
+          };
+          if (receipt.error) throw new Error(`AGY letmeknow startup failed: ${receipt.error}`);
+          if (!receipt.fp) throw new Error("AGY readiness receipt missing fp");
+          if (!receipt.conversationId) throw new Error("AGY readiness receipt missing conversationId");
           if (!receipt.groups?.includes(endpoint.group)) {
-            throw new Error(`Pi ${receipt.fp} did not join group ${endpoint.group}: ${(receipt.warnings ?? []).join("; ")}`);
+            throw new Error(`AGY ${receipt.fp} did not join group ${endpoint.group}: ${(receipt.warnings ?? []).join("; ")}`);
           }
-          this.record({ bind: conv, fp: receipt.fp, scope, owned: true, sessionId, hc: addr });
+          this.record({ bind: conv, fp: receipt.fp, scope, owned: true, conversationId: receipt.conversationId, hc: addr });
           return receipt.fp;
         }
         if (++checks % 10 === 0) {
@@ -687,12 +707,13 @@ Manage reminders and schedules with: python3 /home/spoj/jobs/remind.py add|list|
         }
         await sleep(100, undefined, { signal: this.abort.signal });
       }
-      throw new Error(`Timed out waiting for Pi ${addr} to join letmeknow group ${endpoint.group}`);
+      throw new Error(`Timed out waiting for AGY ${addr} to join letmeknow group ${endpoint.group}`);
     } catch (error) {
-      await this.hc.killAndRemove(addr).catch(() => {});
+      if (addr) await this.hc.killAndRemove(addr).catch(() => {});
       throw error;
     } finally {
       rmSync(readyFile, { force: true });
+      rmSync(promptFile, { force: true });
     }
   }
 
@@ -917,7 +938,7 @@ Manage reminders and schedules with: python3 /home/spoj/jobs/remind.py add|list|
         fp: entry.fp,
         scope,
         owned: Boolean(entry.owned),
-        sessionId: entry.sessionId,
+        conversationId: entry.conversationId,
         hc: entry.hc,
         lastActiveMs: Date.now(),
       };

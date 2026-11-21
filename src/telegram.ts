@@ -113,7 +113,7 @@ export class Telegram {
       if (!allowedSender(ctx) || !ctx.chat) return next();
       const target = conversation(ctx.chat.id, ctx.msg?.is_topic_message ? ctx.msg.message_thread_id : undefined);
       await onNew(target);
-      await ctx.reply("Session reset for this conversation. The next message will start a fresh Pi session.");
+      await ctx.reply("Session reset for this conversation. The next message will start a fresh session.");
     });
 
     bot.use(async (ctx) => {
@@ -143,7 +143,7 @@ export class Telegram {
   }
 
   async run(onStart: () => void): Promise<void> {
-    await this.bot.api.setMyCommands([{ command: "new", description: "Start a fresh Pi session in this conversation" }]);
+    await this.bot.api.setMyCommands([{ command: "new", description: "Start a fresh session in this conversation" }]);
     await this.bot.start({
       allowed_updates: UPDATES,
       onStart: (me) => {

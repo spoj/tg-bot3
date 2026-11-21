@@ -11,8 +11,7 @@ import { Timeline, type Conversation } from "./timeline.ts";
 type Config = {
   token: string;
   cwd: string;
-  agentDir?: string;
-  pi?: string;
+  agy?: string;
   hc?: string;
   idleMs?: number;
   lmk: {
@@ -70,8 +69,7 @@ bridge = new Bridge(
     owner: config.lmk.owner,
     local: config.lmk.local,
     cwd,
-    pi: config.pi ?? "pi",
-    agentDir: config.agentDir ? expand(config.agentDir) : undefined,
+    agy: config.agy ?? "agy",
     botLabel: (path.basename(stateDir) === "bot" ? path.basename(path.dirname(stateDir)) : path.basename(stateDir)) || "default",
     idleMs: config.idleMs,
   },

@@ -1,12 +1,12 @@
 # tg-bot3
 
-Unified multi-chat Telegram gateway for [Pi](https://github.com/earendil-works/pi) over [letmeknow](https://letmeknow.dev) and `hc` (`herdr-core`).
+Unified multi-chat Telegram gateway for Antigravity (`agy`) over [letmeknow](https://letmeknow.dev) and `hc` (`herdr-core`).
 
-Every Telegram conversation `(chat_id, message_thread_id)` maps 1:1 to a `letmeknow` member fingerprint. Independently launched Pis anywhere in your owner group talk through the same gateway as Pis spawned on demand via `hc` in your normal interactive Pi setup (`~/.pi/agent/sessions/`, attachable via `hc attach` / `hcm`, surviving bot restarts).
+Every Telegram conversation `(chat_id, message_thread_id)` maps 1:1 to a `letmeknow` member fingerprint. Independently launched agents anywhere in your owner group talk through the same gateway as AGY sessions spawned on demand via `hc` in your normal interactive AGY setup (`~/.gemini/antigravity-cli/brain/`, attachable via `hc attach` / `hcm`, surviving bot restarts).
 
 ## Setup
 
-Requires Node.js 24+, `pi` (with `pi-letmeknow`), `hc`, and `letmeknow` 0.26+.
+Requires Node.js 24+, `agy` (with `agy-letmeknow`), `hc`, and `letmeknow` 0.26+.
 
 `config.json` (in the state directory, mode `0600`):
 
@@ -30,9 +30,9 @@ Requires Node.js 24+, `pi` (with `pi-letmeknow`), `hc`, and `letmeknow` 0.26+.
 }
 ```
 
-Optional keys: `agentDir`, `pi` (default `pi`), `hc` (default `hc`), `idleMs` (default `3600000`, 1h).
+Optional keys: `agy` (default `agy`), `hc` (default `hc`), `idleMs` (default `3600000`, 1h).
 
-- **Isolation:** `lmk.owner` serves the owner's chat and all independent Pis in the owner group. `lmk.local` serves all other `allowed.json` chats (e.g. family/groups) in a separate machine-local `letmeknow` group so non-owner traffic never reaches other devices.
+- **Isolation:** `lmk.owner` serves the owner's chat and all independent agents in the owner group. `lmk.local` serves all other `allowed.json` chats (e.g. family/groups) in a separate machine-local `letmeknow` group so non-owner traffic never reaches other devices.
 - **`allowed.json`:** array of allowed user and chat IDs. Private chats of listed users are admitted; listed groups/channels are admitted only while a listed user is an admin. Unlisted senders are logged once per process as `telegram.access_request`.
 
 ## Agent wire contract
@@ -45,11 +45,11 @@ Agents send to the bridge's `letmeknow` session fingerprint:
 
 ## Lifecycle & host socket
 
-- **Spawn / resume:** inbound messages (or `wake`) for an unbound or reaped conversation launch/resume `pi --session-id <uuid>` via `hc run --bg --no-parent --outlive-parent` with `PI_LETMEKNOW_JOIN`, `PI_LETMEKNOW_ATTACH=""`, and `PI_LETMEKNOW_READY_FILE`. State persists in `lmk-state.jsonl` (mode `0600`).
-- **Idle reap:** bot-owned `hc` terminals (labeled `owner=tg-bot3`) idle for `idleMs` with status `idle`/`done`, no `hold` label, no active monitors, and no live `hc` children are killed and removed; the next message resumes the same Pi session history. Independently launched Pis are never reaped.
+- **Spawn / resume:** inbound messages (or `wake`) for an unbound or reaped conversation launch `agy --dangerously-skip-permissions` (adding `--conversation <id>` on resume) via `hc run --bg --no-parent --outlive-parent` with `AGY_LETMEKNOW_JOIN`, `AGY_LETMEKNOW_ATTACH=""`, `AGY_LETMEKNOW_READY_FILE`, `AGY_LETMEKNOW_PROMPT_FILE`, and `AGY_CLI_OSC7501=on`. State persists in `lmk-state.jsonl` (mode `0600`).
+- **Idle reap:** bot-owned `hc` terminals (labeled `owner=tg-bot3`) idle for `idleMs` with status `idle`/`done`, no `hold` label, no active monitors, and no live `hc` children are killed and removed; the next message resumes the same AGY conversation. Independently launched agents are never reaped.
 - **Typing indicator:** for bot-owned `hc` terminals, inbound deliveries check `hc get` and send `sendChatAction("typing")` every 4.5s only while `status.state === "working"`. Remote/unowned sessions emit no typing indicator.
-- **`/new`:** kills any bot-owned terminal for that conversation and unbinds it so the next message starts a fresh Pi session.
-- **`host.sock` (mode `0600`):** minimal local Unix socket for scheduled jobs (`~/jobs/tg_notify.py`) exposing `send` (logs to `timeline.jsonl`, wakes no Pi; replies route to the topic's current binding) and `wake` (wakes/resumes the topic's Pi).
+- **`/new`:** kills any bot-owned terminal for that conversation and unbinds it so the next message starts a fresh session.
+- **`host.sock` (mode `0600`):** minimal local Unix socket for scheduled jobs (`~/jobs/tg_notify.py`) exposing `send` (logs to `timeline.jsonl`, wakes no session; replies route to the topic's current binding) and `wake` (wakes/resumes the topic's session).
 
 ## Checks
 
