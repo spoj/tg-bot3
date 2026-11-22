@@ -627,7 +627,6 @@ export class Bridge {
     return `## Telegram conversation (${key})
 
 You are the Antigravity (AGY) agent for Telegram chat_id ${conv.chat_id}${threadNote}.
-Run \`agy-letmeknow bind\` via \`run_command\` on startup or resume if not yet bound.
 Your plain assistant text is not shown in Telegram. Talk to Telegram via \`run_command\` using \`agy-letmeknow\` addressed to bridge session ${endpoint.session}:
 - Text (HTML by default, plain-text fallback on parse error): agy-letmeknow send --to ${endpoint.session} -
 - File/media (photo/voice/audio/video/document auto-selected; text <=1024 chars becomes caption): agy-letmeknow send --to ${endpoint.session} --attach /abs/path -
@@ -635,7 +634,6 @@ Your plain assistant text is not shown in Telegram. Talk to Telegram via \`run_c
 
 Bot state lives in ${this.stateDir} (timeline.jsonl, attachments/, allowed.json, AGENTS.md).
 Incoming Telegram updates arrive as letmeknow messages from ${endpoint.session}; attachments are already downloaded and attached.
-Manage reminders and schedules with: python3 /home/spoj/jobs/remind.py add|list|remove (never edit schedules.json).
 `;
   }
 

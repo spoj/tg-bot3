@@ -267,7 +267,6 @@ test("multi-chat isolation: owner spawns in G_OWNER, Daisy spawns in G_LOCAL, bu
   assert.equal(hc.spawns[0]!.spec.env.AGY_CLI_OSC7501, "on");
   assert.equal(hc.spawns[0]!.promptMode, 0o600);
   assert.match(hc.spawns[0]!.promptContent!, /You are the Antigravity \(AGY\) agent/);
-  assert.match(hc.spawns[0]!.promptContent!, /agy-letmeknow bind/);
   assert.match(hc.spawns[0]!.promptContent!, /agy-letmeknow send --to owner -/);
   assert.match(hc.spawns[0]!.promptContent!, /agy-letmeknow send --to owner --attach \/abs\/path -/);
   assert.match(hc.spawns[0]!.promptContent!, /# Custom Bot Rules\nBe brief\./);
