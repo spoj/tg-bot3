@@ -1,6 +1,6 @@
 import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, rmSync, truncateSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, truncateSync, writeFileSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -8,8 +8,15 @@ import { createInterface } from "node:readline";
 import { setTimeout as sleep } from "node:timers/promises";
 import { promisify } from "node:util";
 import { GrammyError, InputFile } from "grammy";
-import type { HcClient } from "./hc.ts";
-import { MEDIA_FIELDS, type Telegram } from "./telegram.ts";
+import {
+  discoverResumeId,
+  formatLaunchMarker,
+  HarnessRegistry,
+  sanitizeConvFilename,
+  type HarnessConfigMap,
+} from "./harnesses.ts";
+import type { DeliverMode, HcClient } from "./hc.ts";
+import { MEDIA_FIELDS, type ResetResult, type Telegram } from "./telegram.ts";
 import { conversation, conversationKey, type Conversation, type TimelineRecord } from "./timeline.ts";
 
 type Json = Record<string, any>;
@@ -21,13 +28,18 @@ export type BridgeConfig = {
   owner: OwnerConfig;
   local?: EndpointConfig;
   cwd: string;
-  agy: string;
+  harness?: string;
+  harnesses?: HarnessConfigMap;
+  agy?: string;
+  deliver?: DeliverMode;
   botLabel: string;
   idleMs?: number;
   reapIntervalMs?: number;
   readyTimeoutMs?: number;
   typingDelayMs?: number;
   typingIntervalMs?: number;
+  agyBrainDir?: string;
+  codexSessionsDir?: string;
 };
 
 type Binding = {
@@ -35,7 +47,10 @@ type Binding = {
   fp: string;
   scope: Scope;
   owned: boolean;
-  conversationId?: string;
+  harness?: string;
+  resumeId?: string;
+  launchId?: string;
+  launchedAtMs?: number;
   hc?: string;
   lastActiveMs: number;
 };
@@ -336,12 +351,17 @@ export class Bridge {
   private readonly stateDir: string;
   private readonly statePath: string;
   private readonly readyDir: string;
+  private readonly promptsDir: string;
+  private readonly harnesses: HarnessRegistry;
+  private readonly defaultHarness: string;
   private readonly telegram: Telegram;
   private readonly hc: HcClient;
   private readonly abort = new AbortController();
   private readonly endpoints: Record<Scope, LmkEndpoint | undefined>;
   private readonly bindingOfConv = new Map<string, Binding>();
   private readonly bindingOfFp = new Map<string, Binding>();
+  private readonly ownedConvByFp = new Map<string, Conversation>();
+  private readonly pendingHarness = new Map<string, string>();
   private readonly msgByTg = new Map<string, MsgEntry>();
   private readonly tgByLmk = new Map<string, { chat: number; tg: number }>();
   private readonly pollOf = new Map<string, PollEntry>();
@@ -355,6 +375,13 @@ export class Bridge {
     this.stateDir = stateDir;
     this.statePath = path.join(stateDir, "lmk-state.jsonl");
     this.readyDir = path.join(stateDir, "ready");
+    this.promptsDir = path.join(stateDir, "prompts");
+    this.harnesses = new HarnessRegistry({ harnesses: config.harnesses, legacyAgy: config.agy });
+    const defaultHarness = this.harnesses.resolveName(config.harness ?? "agy");
+    if (!defaultHarness) {
+      throw new Error(`Unknown default harness "${config.harness}". Available: ${this.harnesses.names().join(", ")}`);
+    }
+    this.defaultHarness = defaultHarness;
     this.telegram = telegram;
     this.hc = hc;
     const onEvent = (scope: Scope, event: Json, log?: string) => this.fromLmk(scope, event, log);
@@ -397,8 +424,13 @@ export class Bridge {
   pollConversation(id: string): Conversation | undefined {
     const entry = this.pollOf.get(id);
     if (!entry) return undefined;
-    const binding = this.bindingOfFp.get(`${entry.scope}:${entry.fp}`);
-    return binding?.conv ?? conversation(entry.chat);
+    const fpKey = `${entry.scope}:${entry.fp}`;
+    const binding = this.bindingOfFp.get(fpKey);
+    return binding?.conv ?? this.ownedConvByFp.get(fpKey) ?? conversation(entry.chat);
+  }
+
+  availableHarnesses(): string[] {
+    return this.harnesses.names();
   }
 
   handleRecord(record: TimelineRecord): void {
@@ -488,16 +520,26 @@ export class Bridge {
     this.enqueue(conv, () => this.deliverPending(item));
   }
 
-  async resetConversation(conv: Conversation): Promise<void> {
+  async resetConversation(conv: Conversation, requestedHarness?: string): Promise<ResetResult> {
+    const raw = requestedHarness?.trim();
+    let resolved: string | undefined;
+    if (raw) {
+      resolved = this.harnesses.resolveName(raw);
+      if (!resolved) {
+        return { ok: false, error: `Unknown harness "${raw}". Available: ${this.harnesses.names().join(", ")}.` };
+      }
+    }
     const key = conversationKey(conv);
-    const done = this.enqueue(conv, async () => {
+    await this.enqueue(conv, async () => {
       const binding = this.bindingOfConv.get(key);
       if (binding?.owned && binding.hc) {
         await this.hc.killAndRemove(binding.hc).catch((err) => this.report(err));
       }
       if (binding) this.record({ unbind: conv });
+      if (resolved) this.record({ nextHarness: conv, harness: resolved });
+      else if (this.pendingHarness.has(key)) this.record({ nextHarness: conv, harness: null });
     });
-    await done;
+    return { ok: true, harness: resolved ?? this.defaultHarness };
   }
 
   async reapIdle(now = Date.now()): Promise<void> {
@@ -506,6 +548,7 @@ export class Bridge {
       if (!binding.owned || !binding.hc) continue;
       if (now - binding.lastActiveMs < idleMs) continue;
       if (!(await this.hc.isReapable(binding.hc))) continue;
+      this.maybeDiscoverResumeId(binding);
       const addr = binding.hc;
       await this.hc.killAndRemove(addr);
       this.record({ reaped: binding.conv, hc: addr });
@@ -599,37 +642,85 @@ export class Bridge {
     })();
   }
 
-  private async resolveRecipient(conv: Conversation, scope: Scope, originFp?: string): Promise<string> {
-    if (originFp) {
-      const byFp = this.bindingOfFp.get(`${scope}:${originFp}`);
-      if (byFp?.owned) {
-        const alive = byFp.hc ? await this.hc.get(byFp.hc) : null;
-        if (alive?.state === "live") return byFp.fp;
-        return this.launchOrResume(byFp.conv, scope, byFp.conversationId);
-      }
-      return originFp;
+  private maybeDiscoverResumeId(binding: Binding): void {
+    if (!binding.owned || binding.resumeId || !binding.launchId || !binding.harness) return;
+    const basePreset = this.harnesses.basePreset(binding.harness);
+    if (!basePreset) return;
+    const discovered = discoverResumeId({
+      preset: basePreset,
+      launchId: binding.launchId,
+      launchedAtMs: binding.launchedAtMs ?? binding.lastActiveMs,
+      agyBrainDir: this.config.agyBrainDir,
+      codexSessionsDir: this.config.codexSessionsDir,
+    });
+    if (discovered) {
+      this.record({ resume: binding.conv, fp: binding.fp, resumeId: discovered });
     }
+  }
+
+  private async ensureOwnedAlive(binding: Binding): Promise<string> {
+    const alive = binding.hc ? await this.hc.get(binding.hc) : null;
+    if (alive?.state === "live") return binding.fp;
+    this.maybeDiscoverResumeId(binding);
+    return this.launchOrResume(binding.conv, binding.scope, {
+      harness: binding.harness,
+      resumeId: binding.resumeId,
+      savedFp: binding.fp,
+    });
+  }
+
+  private async resolveConversationRecipient(conv: Conversation, scope: Scope): Promise<string> {
     const key = conversationKey(conv);
     const existing = this.bindingOfConv.get(key);
     if (existing) {
       if (!existing.owned) return existing.fp;
-      const alive = existing.hc ? await this.hc.get(existing.hc) : null;
-      if (alive?.state === "live") return existing.fp;
-      return this.launchOrResume(conv, scope, existing.conversationId);
+      return this.ensureOwnedAlive(existing);
     }
     return this.launchOrResume(conv, scope);
   }
 
-  private runtimePrompt(conv: Conversation, scope: Scope): string {
+  private async resolveRecipient(conv: Conversation, scope: Scope, originFp?: string): Promise<string> {
+    if (originFp) {
+      const fpKey = `${scope}:${originFp}`;
+      const byFp = this.bindingOfFp.get(fpKey);
+      if (byFp) {
+        if (!byFp.owned) return byFp.fp;
+        if (conversationKey(byFp.conv) === conversationKey(conv)) {
+          return this.ensureOwnedAlive(byFp);
+        }
+        const alive = byFp.hc ? await this.hc.get(byFp.hc) : null;
+        if (alive?.state === "live") return byFp.fp;
+        return this.resolveConversationRecipient(conv, scope);
+      }
+      const historicalOwnedConv = this.ownedConvByFp.get(fpKey);
+      if (historicalOwnedConv) {
+        if (conversationKey(historicalOwnedConv) === conversationKey(conv)) {
+          return this.resolveConversationRecipient(conv, scope);
+        }
+        const current = this.bindingOfConv.get(conversationKey(historicalOwnedConv));
+        if (current) {
+          if (!current.owned) return current.fp;
+          const alive = current.hc ? await this.hc.get(current.hc) : null;
+          if (alive?.state === "live") return current.fp;
+        }
+        return this.resolveConversationRecipient(conv, scope);
+      }
+      return originFp;
+    }
+    return this.resolveConversationRecipient(conv, scope);
+  }
+
+  private runtimePrompt(conv: Conversation, scope: Scope, launchId?: string): string {
     const endpoint = this.endpoints[scope]!;
     const key = conversationKey(conv);
     const threadNote = conv.message_thread_id ? `, message_thread_id ${conv.message_thread_id}` : "";
-    return `## Telegram conversation (${key})
+    const runTag = launchId ? `\n<!-- ${formatLaunchMarker(launchId)} -->` : "";
+    return `## Telegram conversation (${key})${runTag}
 
-You are the Antigravity (AGY) agent for Telegram chat_id ${conv.chat_id}${threadNote}.
-Your plain assistant text is not shown in Telegram. Talk to Telegram via \`run_command\` using \`agy-letmeknow\` addressed to bridge session ${endpoint.session}:
-- Text (HTML by default, plain-text fallback on parse error): agy-letmeknow send --to ${endpoint.session} -
-- File/media (photo/voice/audio/video/document auto-selected; text <=1024 chars becomes caption): agy-letmeknow send --to ${endpoint.session} --attach /abs/path -
+You are the agent for Telegram chat_id ${conv.chat_id}${threadNote}.
+Your plain assistant text is not shown in Telegram. You are already connected to Telegram via \`lmk\`. Talk to Telegram by running shell commands addressed to bridge session ${endpoint.session}:
+- Text (HTML by default, plain-text fallback on parse error): lmk send --to ${endpoint.session} -
+- File/media (photo/voice/audio/video/document auto-selected; text <=1024 chars becomes caption): lmk send --to ${endpoint.session} --attach /abs/path -
 - Explicit Telegram Bot API call (e.g. editForumTopic, sendPoll, inline keyboards, disable_notification): prefix stdin with "tg: " + JSON, e.g. tg: {"method":"editForumTopic","name":"Topic Name"}. Combine with --attach /abs/path using "attach://file" in the media field.
 
 Bot state lives in ${this.stateDir} (timeline.jsonl, attachments/, allowed.json, AGENTS.md).
@@ -637,82 +728,136 @@ Incoming Telegram updates arrive as letmeknow messages from ${endpoint.session};
 `;
   }
 
-  private async launchOrResume(conv: Conversation, scope: Scope, conversationId?: string): Promise<string> {
+  private writePromptFile(conv: Conversation, content: string): string {
+    mkdirSync(this.promptsDir, { recursive: true, mode: 0o700 });
+    const promptFile = path.join(this.promptsDir, `${sanitizeConvFilename(conversationKey(conv))}.md`);
+    const tmpFile = `${promptFile}.${randomUUID()}.tmp`;
+    writeFileSync(tmpFile, content, { mode: 0o600 });
+    chmodSync(tmpFile, 0o600);
+    renameSync(tmpFile, promptFile);
+    return promptFile;
+  }
+
+  private async launchOrResume(
+    conv: Conversation,
+    scope: Scope,
+    opts: { harness?: string; resumeId?: string; savedFp?: string } = {},
+  ): Promise<string> {
     const endpoint = this.endpoints[scope]!;
     const key = conversationKey(conv);
-    mkdirSync(this.readyDir, { recursive: true, mode: 0o700 });
-    const runId = randomUUID();
-    const readyFile = path.join(this.readyDir, `${runId}.json`);
-    const promptFile = path.join(this.readyDir, `${runId}.prompt.md`);
-    const agentsMd = path.join(this.stateDir, "AGENTS.md");
-    const prompt = existsSync(agentsMd)
-      ? `${this.runtimePrompt(conv, scope)}\n${readFileSync(agentsMd, "utf8")}`
-      : this.runtimePrompt(conv, scope);
-    writeFileSync(promptFile, prompt, { mode: 0o600 });
-    const argv = conversationId
-      ? [
-        this.config.agy,
-        "--dangerously-skip-permissions",
-        "--conversation", conversationId,
-        "-i", "Session resumed for Telegram. Run agy-letmeknow bind now and handle incoming Telegram messages.",
-      ]
-      : [
-        this.config.agy,
-        "--dangerously-skip-permissions",
-        "-i", "Session started for Telegram. Run agy-letmeknow bind now and wait for incoming Telegram messages.",
-      ];
-    const env: Record<string, string> = {
-      AGY_LETMEKNOW_JOIN: endpoint.group,
-      AGY_LETMEKNOW_ATTACH: "",
-      AGY_LETMEKNOW_READY_FILE: readyFile,
-      AGY_LETMEKNOW_PROMPT_FILE: promptFile,
-      AGY_CLI_OSC7501: "on",
-    };
-    const hcName = `tg-${String(conv.chat_id).replace("-", "g")}-${conv.message_thread_id ?? 0}`;
-    let addr: string | undefined;
-    try {
-      addr = await this.hc.spawn({
-        name: hcName,
-        cwd: this.config.cwd,
-        labels: { owner: "tg-bot3", bot: this.config.botLabel, conv: key, scope },
-        env,
-        argv,
+    const harness = (opts.harness ? this.harnesses.resolveName(opts.harness) : undefined)
+      ?? this.pendingHarness.get(key)
+      ?? this.defaultHarness;
+
+    const launchAttempt = async (savedFp?: string): Promise<{ fp: string; addr: string; resumeId?: string; launchId?: string; launchedAtMs?: number }> => {
+      mkdirSync(this.readyDir, { recursive: true, mode: 0o700 });
+      const launchId = randomUUID();
+      const launchedAtMs = Date.now();
+      const readyFile = path.join(this.readyDir, `${launchId}.json`);
+      const agentsMd = path.join(this.stateDir, "AGENTS.md");
+      const hasAgentsMd = existsSync(agentsMd);
+      const prompt = hasAgentsMd
+        ? `${this.runtimePrompt(conv, scope, launchId)}\n${readFileSync(agentsMd, "utf8")}`
+        : this.runtimePrompt(conv, scope, launchId);
+      const promptFile = this.writePromptFile(conv, prompt);
+      const plan = this.harnesses.buildLaunch(harness, {
+        convKey: key,
+        promptText: prompt,
+        promptFile,
+        agentsMdPath: hasAgentsMd ? agentsMd : undefined,
+        bridgeSession: endpoint.session,
+        resumeId: opts.resumeId,
+        launchId,
       });
-      const deadline = Date.now() + (this.config.readyTimeoutMs ?? DEFAULT_READY_TIMEOUT_MS);
-      let checks = 0;
-      while (Date.now() < deadline) {
-        this.abort.signal.throwIfAborted();
-        if (existsSync(readyFile)) {
-          const receipt = JSON.parse(readFileSync(readyFile, "utf8")) as {
-            fp?: string;
-            conversationId?: string;
-            groups?: string[];
-            warnings?: string[];
-            error?: string;
-          };
-          if (receipt.error) throw new Error(`AGY letmeknow startup failed: ${receipt.error}`);
-          if (!receipt.fp) throw new Error("AGY readiness receipt missing fp");
-          if (!receipt.conversationId) throw new Error("AGY readiness receipt missing conversationId");
-          if (!receipt.groups?.includes(endpoint.group)) {
-            throw new Error(`AGY ${receipt.fp} did not join group ${endpoint.group}: ${(receipt.warnings ?? []).join("; ")}`);
+      const hcName = `tg-${String(conv.chat_id).replace("-", "g")}-${conv.message_thread_id ?? 0}`;
+      let addr: string | undefined;
+      try {
+        addr = await this.hc.spawn({
+          name: hcName,
+          cwd: this.config.cwd,
+          labels: { owner: "tg-bot3", bot: this.config.botLabel, conv: key, scope, harness },
+          join: endpoint.group,
+          readyFile,
+          session: savedFp,
+          deliver: this.config.deliver ?? "always",
+          env: plan.env,
+          argv: plan.argv,
+        });
+        const deadline = Date.now() + (this.config.readyTimeoutMs ?? DEFAULT_READY_TIMEOUT_MS);
+        let checks = 0;
+        while (Date.now() < deadline) {
+          this.abort.signal.throwIfAborted();
+          if (existsSync(readyFile)) {
+            const receipt = JSON.parse(readFileSync(readyFile, "utf8")) as {
+              fp?: string;
+              groups?: string[];
+              warnings?: string[];
+              error?: string;
+            };
+            if (receipt.error) {
+              const err = new Error(`${harness} letmeknow startup failed: ${receipt.error}`);
+              if (!receipt.fp) (err as Error & { retryWithoutSession?: boolean }).retryWithoutSession = true;
+              throw err;
+            }
+            if (!receipt.fp) throw new Error(`${harness} readiness receipt missing fp`);
+            if (!receipt.groups?.includes(endpoint.group)) {
+              throw new Error(`${harness} ${receipt.fp} did not join group ${endpoint.group}: ${(receipt.warnings ?? []).join("; ")}`);
+            }
+            let resumeId = plan.resumeId;
+            if (!resumeId && plan.discoverResumeId) {
+              const basePreset = this.harnesses.basePreset(harness);
+              if (basePreset) {
+                resumeId = discoverResumeId({
+                  preset: basePreset,
+                  launchId,
+                  launchedAtMs,
+                  agyBrainDir: this.config.agyBrainDir,
+                  codexSessionsDir: this.config.codexSessionsDir,
+                });
+              }
+            }
+            return {
+              fp: receipt.fp,
+              addr,
+              resumeId,
+              launchId: !resumeId && plan.discoverResumeId ? launchId : undefined,
+              launchedAtMs: !resumeId && plan.discoverResumeId ? launchedAtMs : undefined,
+            };
           }
-          this.record({ bind: conv, fp: receipt.fp, scope, owned: true, conversationId: receipt.conversationId, hc: addr });
-          return receipt.fp;
+          if (++checks % 10 === 0) {
+            const term = await this.hc.get(addr);
+            if (!term || term.state !== "live") throw new Error(`hc terminal ${addr} exited before letmeknow became ready`);
+          }
+          await sleep(100, undefined, { signal: this.abort.signal });
         }
-        if (++checks % 10 === 0) {
-          const term = await this.hc.get(addr);
-          if (!term || term.state !== "live") throw new Error(`hc terminal ${addr} exited before letmeknow became ready`);
-        }
-        await sleep(100, undefined, { signal: this.abort.signal });
+        throw new Error(`Timed out waiting for ${harness} ${addr} to join letmeknow group ${endpoint.group}`);
+      } catch (error) {
+        if (addr) await this.hc.killAndRemove(addr).catch(() => {});
+        throw error;
+      } finally {
+        rmSync(readyFile, { force: true });
       }
-      throw new Error(`Timed out waiting for AGY ${addr} to join letmeknow group ${endpoint.group}`);
+    };
+
+    let launched: { fp: string; addr: string; resumeId?: string; launchId?: string; launchedAtMs?: number };
+    try {
+      launched = await launchAttempt(opts.savedFp);
     } catch (error) {
-      if (addr) await this.hc.killAndRemove(addr).catch(() => {});
-      throw error;
-    } finally {
-      rmSync(readyFile, { force: true });
-      rmSync(promptFile, { force: true });
+      if (!opts.savedFp || !(error as Error & { retryWithoutSession?: boolean })?.retryWithoutSession) throw error;
+      launched = await launchAttempt(undefined);
     }
+
+    this.record({
+      bind: conv,
+      fp: launched.fp,
+      scope,
+      owned: true,
+      harness,
+      ...(launched.resumeId ? { resumeId: launched.resumeId } : {}),
+      ...(launched.launchId ? { launchId: launched.launchId, launchedAtMs: launched.launchedAtMs } : {}),
+      hc: launched.addr,
+    });
+    return launched.fp;
   }
 
   private async createOwnerTopic(fp: string): Promise<number> {
@@ -772,6 +917,7 @@ Incoming Telegram updates arrive as letmeknow messages from ${endpoint.session};
       const binding = this.bindingOfFp.get(`${scope}:${from}`);
       if (binding) {
         binding.lastActiveMs = Date.now();
+        if (binding.owned && !binding.resumeId && binding.launchId) this.maybeDiscoverResumeId(binding);
         if (event.reply_to && !this.tgByLmk.has(`${scope}:${event.reply_to}`)) {
           await this.queues.get(conversationKey(binding.conv));
         }
@@ -922,6 +1068,22 @@ Incoming Telegram updates arrive as letmeknow messages from ${endpoint.session};
       if (prev && (!entry.hc || prev.hc === entry.hc)) prev.hc = undefined;
       return;
     }
+    if ("nextHarness" in entry) {
+      const key = conversationKey(entry.nextHarness);
+      if (typeof entry.harness === "string" && entry.harness) this.pendingHarness.set(key, entry.harness);
+      else this.pendingHarness.delete(key);
+      return;
+    }
+    if ("resume" in entry) {
+      const key = conversationKey(entry.resume);
+      const prev = this.bindingOfConv.get(key);
+      if (prev && (!entry.fp || prev.fp === entry.fp) && typeof entry.resumeId === "string") {
+        prev.resumeId = entry.resumeId;
+        prev.launchId = undefined;
+        prev.launchedAtMs = undefined;
+      }
+      return;
+    }
     if ("bind" in entry) {
       const conv: Conversation = entry.bind;
       const scope: Scope = entry.scope ?? "owner";
@@ -931,17 +1093,36 @@ Incoming Telegram updates arrive as letmeknow messages from ${endpoint.session};
         const oldFpKey = `${prev.scope}:${prev.fp}`;
         if (this.bindingOfFp.get(oldFpKey) === prev) this.bindingOfFp.delete(oldFpKey);
       }
+      const owned = Boolean(entry.owned);
+      let harness: string | undefined = typeof entry.harness === "string" ? entry.harness : undefined;
+      let resumeId: string | undefined = typeof entry.resumeId === "string" ? entry.resumeId : undefined;
+      if (!harness && typeof entry.conversationId === "string") {
+        harness = "agy";
+        resumeId ??= entry.conversationId;
+      } else if (!harness && typeof entry.sessionId === "string") {
+        harness = "pi";
+        resumeId ??= entry.sessionId;
+      } else if (!harness && owned) {
+        harness = this.defaultHarness;
+      }
       const binding: Binding = {
         conv,
         fp: entry.fp,
         scope,
-        owned: Boolean(entry.owned),
-        conversationId: entry.conversationId,
+        owned,
+        harness,
+        resumeId,
+        launchId: typeof entry.launchId === "string" ? entry.launchId : undefined,
+        launchedAtMs: typeof entry.launchedAtMs === "number" ? entry.launchedAtMs : undefined,
         hc: entry.hc,
         lastActiveMs: Date.now(),
       };
       this.bindingOfConv.set(key, binding);
       this.bindingOfFp.set(`${scope}:${entry.fp}`, binding);
+      if (owned) {
+        this.ownedConvByFp.set(`${scope}:${entry.fp}`, conv);
+        this.pendingHarness.delete(key);
+      }
       return;
     }
     // Legacy entries from pre-unification lmk-state.jsonl:

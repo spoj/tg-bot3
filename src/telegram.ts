@@ -20,12 +20,14 @@ const SERVICE_FIELDS = [
   "pinned_message", "video_chat_scheduled", "video_chat_started", "video_chat_ended", "video_chat_participants_invited",
 ];
 
+export type ResetResult = { ok: true; harness: string } | { ok: false; error: string };
+
 export type TelegramOptions = {
   token: string;
   timeline: Timeline;
   allowedPath: string;
   attachmentsDir: string;
-  onNew: (target: Conversation) => Promise<void> | void;
+  onNew: (target: Conversation, harness?: string) => Promise<ResetResult | void> | ResetResult | void;
   pollConversation?: (id: string) => Conversation | undefined;
 };
 
@@ -112,8 +114,14 @@ export class Telegram {
     bot.command("new", async (ctx, next) => {
       if (!allowedSender(ctx) || !ctx.chat) return next();
       const target = conversation(ctx.chat.id, ctx.msg?.is_topic_message ? ctx.msg.message_thread_id : undefined);
-      await onNew(target);
-      await ctx.reply("Session reset for this conversation. The next message will start a fresh session.");
+      const arg = typeof ctx.match === "string" ? ctx.match.trim() : "";
+      const result = await onNew(target, arg || undefined);
+      if (result && !result.ok) {
+        await ctx.reply(result.error);
+        return;
+      }
+      const nextSession = result?.ok ? `fresh ${result.harness} session` : "fresh session";
+      await ctx.reply(`Session reset for this conversation. The next message will start a ${nextSession}.`);
     });
 
     bot.use(async (ctx) => {
@@ -143,7 +151,7 @@ export class Telegram {
   }
 
   async run(onStart: () => void): Promise<void> {
-    await this.bot.api.setMyCommands([{ command: "new", description: "Start a fresh session in this conversation" }]);
+    await this.bot.api.setMyCommands([{ command: "new", description: "Start a fresh session (optional: /new agy|pi|codex|claude)" }]);
     await this.bot.start({
       allowed_updates: UPDATES,
       onStart: (me) => {

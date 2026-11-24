@@ -8,12 +8,21 @@ import { BotError, Context, HttpError, InputFile } from "grammy";
 import { Telegram } from "../src/telegram.ts";
 import { Timeline } from "../src/timeline.ts";
 
-function setup() {
+function setup(onNewImpl?: (target: any, harness?: string) => any) {
   const dir = mkdtempSync(path.join(tmpdir(), "tg-bot3-"));
   writeFileSync(path.join(dir, "allowed.json"), "[10, -20, -21]");
   const timeline = new Timeline(path.join(dir, "timeline.jsonl"));
-  let resets = 0;
-  const telegram = new Telegram({ token: "1:x", timeline, allowedPath: path.join(dir, "allowed.json"), attachmentsDir: dir, onNew: () => { resets++; } });
+  const resets: Array<{ target: any; harness?: string }> = [];
+  const telegram = new Telegram({
+    token: "1:x",
+    timeline,
+    allowedPath: path.join(dir, "allowed.json"),
+    attachmentsDir: dir,
+    onNew: (target, harness) => {
+      resets.push({ target, harness });
+      return onNewImpl?.(target, harness);
+    },
+  });
   telegram.bot.botInfo = { id: 1, is_bot: true, first_name: "Bot", username: "the_bot" } as any;
   const calls: Array<[string, any]> = [];
   telegram.bot.api.config.use(async (_prev, method, payload) => {
@@ -21,7 +30,7 @@ function setup() {
     if (method === "getChatAdministrators") return { ok: true, result: [{ status: "creator", user: user((payload as any).chat_id === -20 ? 10 : 40) }] } as any;
     return { ok: true, result: method === "sendPoll" ? { message_id: 99, poll: { id: "p1" } } : { message_id: 50 } } as any;
   });
-  return { dir, timeline, telegram, calls, resets: () => resets };
+  return { dir, timeline, telegram, calls, resets: () => resets.length, resetCalls: () => resets };
 }
 
 const chat = (id: number) => id > 0 ? { id, type: "private", first_name: "U" } : { id, type: "supergroup", title: "G", is_forum: true };
@@ -90,14 +99,23 @@ test("update failures are logged without the token", async () => {
   assert.doesNotMatch(logged.join("\n"), /1:x/);
 });
 
-test("/new resets the conversation without recording", async () => {
-  const { timeline, telegram, calls, resets } = setup();
+test("/new [harness] resets the conversation, forwards optional harness, and reports unknown harness errors", async () => {
+  const { timeline, telegram, calls, resets, resetCalls } = setup((_target, harness) => {
+    if (harness === "bogus") return { ok: false, error: 'Unknown harness "bogus". Available: agy, pi, codex, claude.' };
+    return { ok: true, harness: harness ?? "agy" };
+  });
   await telegram.bot.handleUpdate({ update_id: 7, message: message(10, { text: "/new", entities: [{ type: "bot_command", offset: 0, length: 4 }] }) } as any);
-  assert.equal(resets(), 1);
-  assert.equal(calls[0]![0], "sendMessage");
+  await telegram.bot.handleUpdate({ update_id: 8, message: message(10, { text: "/new pi", entities: [{ type: "bot_command", offset: 0, length: 4 }] }) } as any);
+  await telegram.bot.handleUpdate({ update_id: 9, message: message(10, { text: "/new@the_bot codex", entities: [{ type: "bot_command", offset: 0, length: 12 }] }) } as any);
+  await telegram.bot.handleUpdate({ update_id: 10, message: message(10, { text: "/new bogus", entities: [{ type: "bot_command", offset: 0, length: 4 }] }) } as any);
+  assert.deepEqual(resetCalls().map((r) => r.harness), [undefined, "pi", "codex", "bogus"]);
+  assert.match(calls[0]![1].text, /fresh agy session/);
+  assert.match(calls[1]![1].text, /fresh pi session/);
+  assert.match(calls[2]![1].text, /fresh codex session/);
+  assert.match(calls[3]![1].text, /Unknown harness "bogus"/);
   assert.equal(timeline.read().length, 0);
-  await telegram.bot.handleUpdate({ update_id: 8, message: message(-20, { from: user(40), text: "/new", entities: [{ type: "bot_command", offset: 0, length: 4 }] }) } as any);
-  assert.equal(resets(), 1);
+  await telegram.bot.handleUpdate({ update_id: 11, message: message(-20, { from: user(40), text: "/new", entities: [{ type: "bot_command", offset: 0, length: 4 }] }) } as any);
+  assert.equal(resets(), 4);
   assert.equal(timeline.read().at(-1)!.meta.allowed_sender, false);
 });
 

@@ -6,7 +6,8 @@ import test, { type TestContext } from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
 import { GrammyError, InputFile } from "grammy";
 import { Bridge, splitHtml } from "../src/bridge.ts";
-import type { HcClient, HcTerminal, SpawnSpec } from "../src/hc.ts";
+import type { HarnessConfigMap } from "../src/harnesses.ts";
+import type { DeliverMode, HcClient, HcTerminal, SpawnSpec } from "../src/hc.ts";
 import { Telegram } from "../src/telegram.ts";
 import { Timeline } from "../src/timeline.ts";
 
@@ -20,32 +21,29 @@ const user = (id: number) => ({ id, is_bot: false, first_name: "U" });
 const chat = (id: number) => id > 0 ? { id, type: "private", first_name: "U" } : { id, type: "supergroup", title: "G", is_forum: true };
 
 class FakeHc implements HcClient {
-  spawns: Array<{ addr: string; spec: SpawnSpec; fp: string; conversationId: string; promptContent?: string; promptMode?: number }> = [];
+  spawns: Array<{ addr: string; spec: SpawnSpec; fp: string; promptContent?: string; promptMode?: number }> = [];
   terminals = new Map<string, HcTerminal>();
   reapable = new Set<string>();
   killed: string[] = [];
   nextFp?: (spec: SpawnSpec, n: number) => string;
-  nextConversationId?: (spec: SpawnSpec, n: number) => string;
   nextReceipt?: (spec: SpawnSpec, n: number) => object;
+  onSpawn?: (spec: SpawnSpec, n: number, addr: string) => void;
 
   async spawn(spec: SpawnSpec): Promise<string> {
     const n = this.spawns.length + 1;
     const addr = `t${n}`;
-    const fp = this.nextFp ? this.nextFp(spec, n) : `spawn${n}`;
-    const convFlag = spec.argv.indexOf("--conversation");
-    const resumedId = convFlag >= 0 ? spec.argv[convFlag + 1] : undefined;
-    const conversationId = this.nextConversationId ? this.nextConversationId(spec, n) : (resumedId ?? `conv-${n}`);
-    const promptFile = spec.env.AGY_LETMEKNOW_PROMPT_FILE;
+    const fp = this.nextFp ? this.nextFp(spec, n) : (spec.session ?? `spawn${n}`);
+    const promptFile = spec.env?.AGY_PROMPT_FILE;
     const promptContent = promptFile && existsSync(promptFile) ? readFileSync(promptFile, "utf8") : undefined;
     const promptMode = promptFile && existsSync(promptFile) ? statSync(promptFile).mode & 0o777 : undefined;
-    this.spawns.push({ addr, spec, fp, conversationId, promptContent, promptMode });
+    this.spawns.push({ addr, spec, fp, promptContent, promptMode });
     this.terminals.set(addr, { address: addr, state: "live", status: { state: "idle" }, labels: spec.labels });
-    const readyFile = spec.env.AGY_LETMEKNOW_READY_FILE;
-    if (readyFile) {
-      mkdirSync(path.dirname(readyFile), { recursive: true });
-      const groups = (spec.env.AGY_LETMEKNOW_JOIN ?? "").split(",").filter(Boolean);
-      const receipt = this.nextReceipt ? this.nextReceipt(spec, n) : { fp, conversationId, groups, warnings: [] };
-      writeFileSync(readyFile, JSON.stringify(receipt) + "\n");
+    this.onSpawn?.(spec, n, addr);
+    if (spec.readyFile) {
+      mkdirSync(path.dirname(spec.readyFile), { recursive: true });
+      const groups = spec.join.split(",").filter(Boolean);
+      const receipt = this.nextReceipt ? this.nextReceipt(spec, n) : { fp, groups, warnings: [] };
+      writeFileSync(spec.readyFile, JSON.stringify(receipt) + "\n");
     }
     return addr;
   }
@@ -65,26 +63,35 @@ class FakeHc implements HcClient {
   }
 }
 
-function setup(
-  t: TestContext,
-  {
-    entries = [],
-    agentsMd,
-    apiHook,
-    typingDelayMs = 0,
-    typingIntervalMs = 0,
-  }: { entries?: object[]; agentsMd?: string; apiHook?: (method: string, params: any) => any; typingDelayMs?: number; typingIntervalMs?: number } = {},
-) {
-  const dir = mkdtempSync(path.join(tmpdir(), "tg-bot3-bridge-"));
+type SetupOptions = {
+  dir?: string;
+  entries?: object[];
+  agentsMd?: string;
+  harness?: string;
+  harnesses?: HarnessConfigMap;
+  agy?: string;
+  deliver?: DeliverMode;
+  agyBrainDir?: string;
+  codexSessionsDir?: string;
+  apiHook?: (method: string, params: any) => any;
+  typingDelayMs?: number;
+  typingIntervalMs?: number;
+};
+
+function setup(t: TestContext, opts: SetupOptions = {}) {
+  const ownsDir = !opts.dir;
+  const dir = opts.dir ?? mkdtempSync(path.join(tmpdir(), "tg-bot3-bridge-"));
   const state = (file: string) => path.join(dir, file);
   const read = (file: string): any[] => existsSync(state(file))
     ? readFileSync(state(file), "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line))
     : [];
-  writeFileSync(state("allowed.json"), JSON.stringify([OWNER_USER, DAISY_CHAT, GROUP_CHAT]));
-  writeFileSync(state("owner-events.jsonl"), "");
-  writeFileSync(state("local-events.jsonl"), "");
-  if (agentsMd !== undefined) writeFileSync(state("AGENTS.md"), agentsMd);
-  if (entries.length) writeFileSync(state("lmk-state.jsonl"), entries.map((e) => JSON.stringify(e) + "\n").join(""));
+  if (!existsSync(state("allowed.json"))) {
+    writeFileSync(state("allowed.json"), JSON.stringify([OWNER_USER, DAISY_CHAT, GROUP_CHAT]));
+  }
+  if (!existsSync(state("owner-events.jsonl"))) writeFileSync(state("owner-events.jsonl"), "");
+  if (!existsSync(state("local-events.jsonl"))) writeFileSync(state("local-events.jsonl"), "");
+  if (opts.agentsMd !== undefined) writeFileSync(state("AGENTS.md"), opts.agentsMd);
+  if (opts.entries?.length) writeFileSync(state("lmk-state.jsonl"), opts.entries.map((e) => JSON.stringify(e) + "\n").join(""));
 
   const timeline = new Timeline(state("timeline.jsonl"));
   const hc = new FakeHc();
@@ -94,7 +101,7 @@ function setup(
     timeline,
     allowedPath: state("allowed.json"),
     attachmentsDir: state("attachments"),
-    onNew: (target) => bridge.resetConversation(target),
+    onNew: (target, harness) => bridge.resetConversation(target, harness),
     pollConversation: (id) => bridge.pollConversation(id),
   });
   telegram.bot.botInfo = { id: 1, is_bot: true, first_name: "Bot", username: "the_bot" } as any;
@@ -104,8 +111,8 @@ function setup(
   telegram.bot.api.config.use(async (_prev, method, params) => {
     if (method === "getChatAdministrators") return { ok: true, result: [{ status: "creator", user: user(OWNER_USER) }] } as any;
     requests.push([method, params]);
-    if (apiHook) {
-      const hookRes = apiHook(method, params);
+    if (opts.apiHook) {
+      const hookRes = opts.apiHook(method, params);
       if (hookRes !== undefined) return hookRes;
     }
     const result = method === "createForumTopic" ? { message_thread_id: 9 }
@@ -121,13 +128,18 @@ function setup(
       owner: { session: "owner", group: "G_OWNER", chat: OWNER_CHAT, user: OWNER_USER },
       local: { session: "local", group: "G_LOCAL" },
       cwd: dir,
-      agy: "agy",
+      harness: opts.harness,
+      harnesses: opts.harnesses,
+      agy: opts.agy,
+      deliver: opts.deliver,
       botLabel: "test",
       idleMs: 1_000,
       reapIntervalMs: 0,
       readyTimeoutMs: 5_000,
-      typingDelayMs,
-      typingIntervalMs,
+      typingDelayMs: opts.typingDelayMs ?? 0,
+      typingIntervalMs: opts.typingIntervalMs ?? 0,
+      agyBrainDir: opts.agyBrainDir ?? path.join(dir, "brain"),
+      codexSessionsDir: opts.codexSessionsDir ?? path.join(dir, "codex-sessions"),
     },
     dir,
     telegram,
@@ -136,7 +148,7 @@ function setup(
   timeline.subscribe((record) => bridge.handleRecord(record));
   t.after(async () => {
     await bridge.stop();
-    rmSync(dir, { force: true, recursive: true });
+    if (ownsDir) rmSync(dir, { force: true, recursive: true });
   });
   bridge.start();
 
@@ -246,8 +258,8 @@ test("explicit 'tg: ' Bot API calls support attach://, block cross-chat override
   assert.equal(calls[3].file, "TG bytes");
 });
 
-test("multi-chat isolation: owner spawns in G_OWNER, Daisy spawns in G_LOCAL, bursts serialize into one spawn", async (t) => {
-  const { telegram, hc, wait, lmkEvent, waitReq, requests } = setup(t, {
+test("multi-chat isolation: owner spawns in G_OWNER, Daisy spawns in G_LOCAL, bursts serialize into one spawn, and prompt files persist", async (t) => {
+  const { telegram, hc, wait, lmkEvent, waitReq, requests, state } = setup(t, {
     agentsMd: "# Custom Bot Rules\nBe brief.\n",
   });
   await Promise.all([
@@ -256,22 +268,27 @@ test("multi-chat isolation: owner spawns in G_OWNER, Daisy spawns in G_LOCAL, bu
   ]);
   const ownerCalls = await wait("owner-calls.jsonl", 2);
   assert.equal(hc.spawns.length, 1);
-  assert.deepEqual(hc.spawns[0]!.spec.argv, [
-    "agy",
-    "--dangerously-skip-permissions",
-    "-i",
-    "Session started for Telegram. Run agy-letmeknow bind now and wait for incoming Telegram messages.",
-  ]);
-  assert.equal(hc.spawns[0]!.spec.env.AGY_LETMEKNOW_JOIN, "G_OWNER");
-  assert.equal(hc.spawns[0]!.spec.env.AGY_LETMEKNOW_ATTACH, "");
-  assert.equal(hc.spawns[0]!.spec.env.AGY_CLI_OSC7501, "on");
-  assert.equal(hc.spawns[0]!.promptMode, 0o600);
-  assert.match(hc.spawns[0]!.promptContent!, /You are the Antigravity \(AGY\) agent/);
-  assert.match(hc.spawns[0]!.promptContent!, /agy-letmeknow send --to owner -/);
-  assert.match(hc.spawns[0]!.promptContent!, /agy-letmeknow send --to owner --attach \/abs\/path -/);
-  assert.match(hc.spawns[0]!.promptContent!, /# Custom Bot Rules\nBe brief\./);
-  assert.equal(existsSync(hc.spawns[0]!.spec.env.AGY_LETMEKNOW_READY_FILE!), false);
-  assert.equal(existsSync(hc.spawns[0]!.spec.env.AGY_LETMEKNOW_PROMPT_FILE!), false);
+  const s0 = hc.spawns[0]!;
+  assert.equal(s0.spec.join, "G_OWNER");
+  assert.equal(s0.spec.deliver, "always");
+  assert.equal(s0.spec.labels.harness, "agy");
+  assert.equal(s0.spec.argv[0], "agy");
+  assert.equal(s0.spec.argv[1], "--dangerously-skip-permissions");
+  assert.equal(s0.spec.argv[2], "-i");
+  assert.doesNotMatch(s0.spec.argv[3]!, /agy-letmeknow/);
+  assert.match(s0.spec.argv[3]!, /lmk send --to owner -/);
+  const expectedPromptPath = state(path.join("prompts", `${OWNER_CHAT}_77.md`));
+  assert.equal(s0.spec.env?.AGY_PROMPT_FILE, expectedPromptPath);
+  assert.equal(s0.promptMode, 0o600);
+  assert.match(s0.promptContent!, /You are the agent for Telegram chat_id 10, message_thread_id 77/);
+  assert.match(s0.promptContent!, /lmk send --to owner -/);
+  assert.match(s0.promptContent!, /lmk send --to owner --attach \/abs\/path -/);
+  assert.doesNotMatch(s0.promptContent!, /agy-letmeknow/);
+  assert.match(s0.promptContent!, /# Custom Bot Rules\nBe brief\./);
+  // Ready file is cleaned up, while persistent prompt file stays intact (no race with harness boot).
+  assert.equal(existsSync(s0.spec.readyFile), false);
+  assert.equal(existsSync(expectedPromptPath), true);
+  assert.equal(statSync(expectedPromptPath).mode & 0o777, 0o600);
   assert.deepEqual(ownerCalls.map((c) => JSON.parse(c.body).message.text), ["first", "second"]);
 
   await telegram.bot.handleUpdate({
@@ -280,9 +297,8 @@ test("multi-chat isolation: owner spawns in G_OWNER, Daisy spawns in G_LOCAL, bu
   } as any);
   const localCalls = await wait("local-calls.jsonl", 1);
   assert.equal(hc.spawns.length, 2);
-  assert.equal(hc.spawns[1]!.spec.env.AGY_LETMEKNOW_JOIN, "G_LOCAL");
-  assert.equal(hc.spawns[1]!.spec.env.AGY_CLI_OSC7501, "on");
-  assert.match(hc.spawns[1]!.promptContent!, /agy-letmeknow send --to local -/);
+  assert.equal(hc.spawns[1]!.spec.join, "G_LOCAL");
+  assert.match(hc.spawns[1]!.promptContent!, /lmk send --to local -/);
   assert.equal(JSON.parse(localCalls[0].body).message.text, "hi from daisy");
 
   // Daisy's agent replies over local endpoint -> routes strictly to Daisy's chat/topic.
@@ -296,99 +312,199 @@ test("multi-chat isolation: owner spawns in G_OWNER, Daisy spawns in G_LOCAL, bu
   assert.match(localAfter[1].body, /Unbound local sender/);
 });
 
-test("sleeping-topic reminder -> reply resumes same conversationId (even with rotated fp), and /new resets to fresh conversationId", async (t) => {
-  const { telegram, bridge, hc, wait, read } = setup(t);
-  // 1. Initial message spawns fresh AGY conversation C1 without --conversation.
-  await telegram.bot.handleUpdate({
+test("all 4 harness presets via /new <harness>, savedFp reuse on resume, discovery for agy/codex, and /new persistence across restart", async (t) => {
+  const dir = mkdtempSync(path.join(tmpdir(), "tg-bot3-harnesses-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const brainDir = path.join(dir, "brain");
+  const codexDir = path.join(dir, "codex-sessions");
+
+  const env1 = setup(t, { dir, agyBrainDir: brainDir, codexSessionsDir: codexDir });
+
+  // 1. Default agy in topic 100 -> simulate AGY creating transcript with marker -> reapIdle discovers resumeId -> resume reuses resumeId AND savedFp.
+  const agyUuid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  env1.hc.onSpawn = (spec) => {
+    if (spec.labels.harness === "agy" && !spec.argv.includes("--conversation")) {
+      const m = spec.argv[spec.argv.indexOf("-i") + 1]!.match(/tg-bot3-run:[0-9a-f-]+/);
+      if (m) {
+        const logDir = path.join(brainDir, agyUuid, ".system_generated", "logs");
+        mkdirSync(logDir, { recursive: true });
+        writeFileSync(path.join(logDir, "transcript.jsonl"), JSON.stringify({ content: m[0] }) + "\n");
+      }
+    }
+  };
+  await env1.telegram.bot.handleUpdate({
     update_id: 1,
-    message: { message_id: 301, date: 0, chat: chat(OWNER_CHAT), from: user(OWNER_USER), is_topic_message: true, message_thread_id: 9885, text: "morning" },
+    message: { message_id: 1001, date: 0, chat: chat(OWNER_CHAT), from: user(OWNER_USER), is_topic_message: true, message_thread_id: 100, text: "start agy" },
   } as any);
-  await wait("owner-calls.jsonl", 1);
-  assert.equal(hc.spawns[0]!.spec.argv.includes("--conversation"), false);
-  const firstConversationId = hc.spawns[0]!.conversationId;
-  const bindEntry = read("lmk-state.jsonl").findLast((e) => "bind" in e);
-  assert.equal(bindEntry.conversationId, firstConversationId);
-  assert.equal("sessionId" in bindEntry, false);
+  await env1.wait("owner-calls.jsonl", 1);
+  const agyFp = env1.hc.spawns[0]!.fp;
+  assert.equal(env1.hc.spawns[0]!.spec.session, undefined);
 
-  // 2. Idle reap kills owned terminal t1.
-  hc.reapable.add("t1");
-  await bridge.reapIdle(Date.now() + 2_000);
-  assert.deepEqual(hc.killed, ["t1"]);
+  env1.hc.reapable.add("t1");
+  await env1.bridge.reapIdle(Date.now() + 2_000);
+  assert.deepEqual(env1.hc.killed, ["t1"]);
 
-  // 3. Scheduled reminder delivered via telegram.send directly (like host.sock send) while topic session is asleep.
-  const sent: any = await telegram.send({ chat_id: OWNER_CHAT, message_thread_id: 9885 }, { method: "sendMessage", text: "Reminder: check calendar" });
-  assert.equal(hc.spawns.length, 1); // Sending reminder did NOT wake session.
-
-  // 4. Matthew replies to that reminder -> resumes same conversationId C1 even with rotated fp.
-  hc.nextFp = () => "rotated_fp";
-  await telegram.bot.handleUpdate({
+  // Next message resumes agy with discovered --conversation AND --session <agyFp>.
+  await env1.telegram.bot.handleUpdate({
     update_id: 2,
-    message: {
-      message_id: 302,
-      date: 0,
-      chat: chat(OWNER_CHAT),
-      from: user(OWNER_USER),
-      is_topic_message: true,
-      message_thread_id: 9885,
-      reply_to_message: { message_id: sent.message_id, date: 0, chat: chat(OWNER_CHAT) },
-      text: "done, thanks",
-    },
+    message: { message_id: 1002, date: 0, chat: chat(OWNER_CHAT), from: user(OWNER_USER), is_topic_message: true, message_thread_id: 100, text: "resume agy" },
   } as any);
-  const callsAfterResume = await wait("owner-calls.jsonl", 2);
-  assert.equal(hc.spawns.length, 2);
-  assert.deepEqual(hc.spawns[1]!.spec.argv, [
-    "agy",
-    "--dangerously-skip-permissions",
-    "--conversation",
-    firstConversationId,
-    "-i",
-    "Session resumed for Telegram. Run agy-letmeknow bind now and handle incoming Telegram messages.",
-  ]);
-  assert.ok(callsAfterResume[1].args.includes("rotated_fp"));
+  await env1.wait("owner-calls.jsonl", 2);
+  assert.equal(env1.hc.spawns[1]!.spec.session, agyFp);
+  assert.equal(env1.hc.spawns[1]!.spec.argv[env1.hc.spawns[1]!.spec.argv.indexOf("--conversation") + 1], agyUuid);
 
-  // 5. /new kills t2 and unbinds; next message starts a fresh conversation without --conversation.
-  await telegram.bot.handleUpdate({
+  // Unknown /new harness is rejected WITHOUT killing live terminal t2.
+  await env1.telegram.bot.handleUpdate({
     update_id: 3,
-    message: { message_id: 303, date: 0, chat: chat(OWNER_CHAT), from: user(OWNER_USER), is_topic_message: true, message_thread_id: 9885, text: "/new", entities: [{ type: "bot_command", offset: 0, length: 4 }] },
+    message: { message_id: 1003, date: 0, chat: chat(OWNER_CHAT), from: user(OWNER_USER), is_topic_message: true, message_thread_id: 100, text: "/new unknown", entities: [{ type: "bot_command", offset: 0, length: 4 }] },
   } as any);
-  assert.deepEqual(hc.killed, ["t1", "t2"]);
+  assert.deepEqual(env1.hc.killed, ["t1"]);
+  assert.match(env1.requests.at(-1)![1].text, /Unknown harness "unknown"/);
+  assert.match(env1.requests.at(-1)![1].text, /agy, pi, codex, claude/);
 
-  hc.nextFp = () => "fresh_fp";
-  await telegram.bot.handleUpdate({
+  // 2. /new pi -> kills t2, pins pi, spawns pi with UUID, reaps, resumes with same UUID AND savedFp.
+  await env1.telegram.bot.handleUpdate({
     update_id: 4,
-    message: { message_id: 304, date: 0, chat: chat(OWNER_CHAT), from: user(OWNER_USER), is_topic_message: true, message_thread_id: 9885, text: "fresh start" },
+    message: { message_id: 1004, date: 0, chat: chat(OWNER_CHAT), from: user(OWNER_USER), is_topic_message: true, message_thread_id: 100, text: "/new pi", entities: [{ type: "bot_command", offset: 0, length: 4 }] },
   } as any);
-  await wait("owner-calls.jsonl", 3);
-  assert.deepEqual(hc.spawns[2]!.spec.argv, [
-    "agy",
-    "--dangerously-skip-permissions",
-    "-i",
-    "Session started for Telegram. Run agy-letmeknow bind now and wait for incoming Telegram messages.",
-  ]);
-  assert.notEqual(hc.spawns[2]!.conversationId, firstConversationId);
+  assert.deepEqual(env1.hc.killed, ["t1", "t2"]);
+
+  await env1.telegram.bot.handleUpdate({
+    update_id: 5,
+    message: { message_id: 1005, date: 0, chat: chat(OWNER_CHAT), from: user(OWNER_USER), is_topic_message: true, message_thread_id: 100, text: "hi pi" },
+  } as any);
+  await env1.wait("owner-calls.jsonl", 3);
+  const piSpawn1 = env1.hc.spawns[2]!;
+  assert.equal(piSpawn1.spec.argv[0], "pi");
+  assert.equal(piSpawn1.spec.session, undefined);
+  const piSessionId = piSpawn1.spec.argv[piSpawn1.spec.argv.indexOf("--session-id") + 1]!;
+  assert.equal(piSpawn1.spec.argv[piSpawn1.spec.argv.indexOf("--name") + 1], `tg ${OWNER_CHAT}:100`);
+
+  env1.hc.reapable.add(piSpawn1.addr);
+  await env1.bridge.reapIdle(Date.now() + 2_000);
+  await env1.telegram.bot.handleUpdate({
+    update_id: 6,
+    message: { message_id: 1006, date: 0, chat: chat(OWNER_CHAT), from: user(OWNER_USER), is_topic_message: true, message_thread_id: 100, text: "resume pi" },
+  } as any);
+  await env1.wait("owner-calls.jsonl", 4);
+  const piSpawn2 = env1.hc.spawns[3]!;
+  assert.equal(piSpawn2.spec.argv[0], "pi");
+  assert.equal(piSpawn2.spec.argv[piSpawn2.spec.argv.indexOf("--session-id") + 1], piSessionId);
+  assert.equal(piSpawn2.spec.session, piSpawn1.fp);
+
+  // 3. /new claude -> first launch uses --session-id, resume uses --resume with same UUID and savedFp.
+  await env1.telegram.bot.handleUpdate({
+    update_id: 7,
+    message: { message_id: 1007, date: 0, chat: chat(OWNER_CHAT), from: user(OWNER_USER), is_topic_message: true, message_thread_id: 100, text: "/new claude", entities: [{ type: "bot_command", offset: 0, length: 4 }] },
+  } as any);
+  await env1.telegram.bot.handleUpdate({
+    update_id: 8,
+    message: { message_id: 1008, date: 0, chat: chat(OWNER_CHAT), from: user(OWNER_USER), is_topic_message: true, message_thread_id: 100, text: "hi claude" },
+  } as any);
+  await env1.wait("owner-calls.jsonl", 5);
+  const claudeSpawn1 = env1.hc.spawns[4]!;
+  assert.equal(claudeSpawn1.spec.argv[0], "claude");
+  assert.ok(claudeSpawn1.spec.argv.includes("--dangerously-skip-permissions"));
+  const claudeSessionId = claudeSpawn1.spec.argv[claudeSpawn1.spec.argv.indexOf("--session-id") + 1]!;
+
+  env1.hc.reapable.add(claudeSpawn1.addr);
+  await env1.bridge.reapIdle(Date.now() + 2_000);
+  await env1.telegram.bot.handleUpdate({
+    update_id: 9,
+    message: { message_id: 1009, date: 0, chat: chat(OWNER_CHAT), from: user(OWNER_USER), is_topic_message: true, message_thread_id: 100, text: "resume claude" },
+  } as any);
+  await env1.wait("owner-calls.jsonl", 6);
+  const claudeSpawn2 = env1.hc.spawns[5]!;
+  assert.equal(claudeSpawn2.spec.argv[0], "claude");
+  assert.equal(claudeSpawn2.spec.argv.includes("--session-id"), false);
+  assert.equal(claudeSpawn2.spec.argv[claudeSpawn2.spec.argv.indexOf("--resume") + 1], claudeSessionId);
+  assert.equal(claudeSpawn2.spec.session, claudeSpawn1.fp);
+
+  // 4. /new codex persisted across Bridge restart!
+  await env1.telegram.bot.handleUpdate({
+    update_id: 10,
+    message: { message_id: 1010, date: 0, chat: chat(OWNER_CHAT), from: user(OWNER_USER), is_topic_message: true, message_thread_id: 100, text: "/new codex", entities: [{ type: "bot_command", offset: 0, length: 4 }] },
+  } as any);
+  await env1.bridge.stop();
+
+  // Restart bridge on the same state directory -> pending codex choice survives!
+  const env2 = setup(t, { dir, agyBrainDir: brainDir, codexSessionsDir: codexDir });
+  const codexUuid = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  env2.hc.onSpawn = (spec) => {
+    if (spec.labels.harness === "codex" && spec.argv[1] !== "resume") {
+      const cfg = spec.argv[spec.argv.indexOf("-c") + 1]!;
+      const m = cfg.match(/tg-bot3-run:[0-9a-f-]+/);
+      if (m) {
+        const d = new Date();
+        const pad = (n: number) => String(n).padStart(2, "0");
+        const dayDir = path.join(codexDir, String(d.getFullYear()), pad(d.getMonth() + 1), pad(d.getDate()));
+        mkdirSync(dayDir, { recursive: true });
+        writeFileSync(
+          path.join(dayDir, `rollout-2026-11-24T16-00-00-${codexUuid}.jsonl`),
+          JSON.stringify({ type: "session_meta", payload: { id: codexUuid } }) + "\n"
+            + JSON.stringify({ type: "response_item", payload: { role: "developer", content: [{ text: m[0] }] } }) + "\n",
+        );
+      }
+    }
+  };
+  await env2.telegram.bot.handleUpdate({
+    update_id: 11,
+    message: { message_id: 1011, date: 0, chat: chat(OWNER_CHAT), from: user(OWNER_USER), is_topic_message: true, message_thread_id: 100, text: "hi codex" },
+  } as any);
+  await env2.wait("owner-calls.jsonl", 7);
+  const codexSpawn1 = env2.hc.spawns[0]!;
+  assert.equal(codexSpawn1.spec.argv[0], "codex");
+  assert.equal(codexSpawn1.spec.argv[1], "--no-daemon");
+
+  env2.hc.reapable.add(codexSpawn1.addr);
+  await env2.bridge.reapIdle(Date.now() + 2_000);
+  await env2.telegram.bot.handleUpdate({
+    update_id: 12,
+    message: { message_id: 1012, date: 0, chat: chat(OWNER_CHAT), from: user(OWNER_USER), is_topic_message: true, message_thread_id: 100, text: "resume codex" },
+  } as any);
+  await env2.wait("owner-calls.jsonl", 8);
+  const codexSpawn2 = env2.hc.spawns[1]!;
+  assert.equal(codexSpawn2.spec.argv[0], "codex");
+  assert.equal(codexSpawn2.spec.argv[1], "resume");
+  assert.equal(codexSpawn2.spec.argv.at(-1), codexUuid);
+  assert.equal(codexSpawn2.spec.session, codexSpawn1.fp);
+
+  // 5. Plain /new resets back to default harness (agy).
+  await env2.telegram.bot.handleUpdate({
+    update_id: 13,
+    message: { message_id: 1013, date: 0, chat: chat(OWNER_CHAT), from: user(OWNER_USER), is_topic_message: true, message_thread_id: 100, text: "/new", entities: [{ type: "bot_command", offset: 0, length: 4 }] },
+  } as any);
+  await env2.telegram.bot.handleUpdate({
+    update_id: 14,
+    message: { message_id: 1014, date: 0, chat: chat(OWNER_CHAT), from: user(OWNER_USER), is_topic_message: true, message_thread_id: 100, text: "back to agy" },
+  } as any);
+  await env2.wait("owner-calls.jsonl", 9);
+  assert.equal(env2.hc.spawns[2]!.spec.argv[0], "agy");
+  assert.equal(env2.hc.spawns[2]!.spec.session, undefined);
 });
 
-test("legacy sessionId bindings in lmk-state.jsonl start fresh without --conversation while keeping unowned bindings and poll/reply maps", async (t) => {
+test("legacy conversationId (agy) and sessionId (pi) bindings replay cleanly and resume with savedFp", async (t) => {
   const { telegram, bridge, hc, wait, read } = setup(t, {
     entries: [
-      { bind: { chat_id: OWNER_CHAT, message_thread_id: 42 }, fp: "old_fp_42", scope: "owner", owned: true, sessionId: "legacy-uuid-42", hc: "dead-42" },
-      { bind: { chat_id: OWNER_CHAT, message_thread_id: 43 }, fp: "old_fp_43", scope: "owner", owned: true, sessionId: "legacy-uuid-43", hc: "dead-43" },
-      { chat: OWNER_CHAT, tg: 601, lmk: "old-lmk-601", scope: "owner", fp: "old_fp_43" },
+      { bind: { chat_id: OWNER_CHAT, message_thread_id: 42 }, fp: "old_agy_fp", scope: "owner", owned: true, conversationId: "legacy-agy-conv", hc: "dead-42" },
+      { bind: { chat_id: OWNER_CHAT, message_thread_id: 43 }, fp: "old_pi_fp", scope: "owner", owned: true, sessionId: "legacy-pi-uuid", hc: "dead-43" },
+      { chat: OWNER_CHAT, tg: 601, lmk: "old-lmk-601", scope: "owner", fp: "old_pi_fp" },
       { bind: { chat_id: OWNER_CHAT, message_thread_id: 9 }, fp: REMOTE_FP, scope: "owner", owned: false },
       { chat: OWNER_CHAT, poll: "poll-1", lmk: "lmk-poll-1", scope: "owner", fp: REMOTE_FP },
     ],
   });
 
-  // Direct message in legacy-bound topic 42 starts fresh without passing --conversation.
+  // Legacy conversationId -> resumes as agy with --conversation legacy-agy-conv and --session old_agy_fp.
   await telegram.bot.handleUpdate({
     update_id: 1,
     message: { message_id: 701, date: 0, chat: chat(OWNER_CHAT), from: user(OWNER_USER), is_topic_message: true, message_thread_id: 42, text: "hello 42" },
   } as any);
   await wait("owner-calls.jsonl", 1);
-  assert.equal(hc.spawns.length, 1);
-  assert.equal(hc.spawns[0]!.spec.argv.includes("--conversation"), false);
+  assert.equal(hc.spawns[0]!.spec.argv[0], "agy");
+  assert.equal(hc.spawns[0]!.spec.argv[hc.spawns[0]!.spec.argv.indexOf("--conversation") + 1], "legacy-agy-conv");
+  assert.equal(hc.spawns[0]!.spec.session, "old_agy_fp");
 
-  // Reply to a legacy message in topic 43 (originFp -> owned binding) also starts fresh without --conversation.
+  // Legacy sessionId -> resumes as pi with --session-id legacy-pi-uuid and --session old_pi_fp.
   await telegram.bot.handleUpdate({
     update_id: 2,
     message: {
@@ -403,12 +519,18 @@ test("legacy sessionId bindings in lmk-state.jsonl start fresh without --convers
     },
   } as any);
   await wait("owner-calls.jsonl", 2);
-  assert.equal(hc.spawns.length, 2);
-  assert.equal(hc.spawns[1]!.spec.argv.includes("--conversation"), false);
+  assert.equal(hc.spawns[1]!.spec.argv[0], "pi");
+  assert.equal(hc.spawns[1]!.spec.argv[hc.spawns[1]!.spec.argv.indexOf("--session-id") + 1], "legacy-pi-uuid");
+  assert.equal(hc.spawns[1]!.spec.session, "old_pi_fp");
 
-  // New bindings persist conversationId from the AGY ready receipt.
-  const binds = read("lmk-state.jsonl").filter((e) => "bind" in e && e.conversationId);
-  assert.deepEqual(binds.map((b) => b.conversationId), ["conv-1", "conv-2"]);
+  const newBinds = read("lmk-state.jsonl").filter((e) => "bind" in e && e.harness);
+  assert.deepEqual(
+    newBinds.map((b) => ({ harness: b.harness, resumeId: b.resumeId, fp: b.fp })),
+    [
+      { harness: "agy", resumeId: "legacy-agy-conv", fp: "old_agy_fp" },
+      { harness: "pi", resumeId: "legacy-pi-uuid", fp: "old_pi_fp" },
+    ],
+  );
 
   // Unowned bindings and poll maps remain intact.
   await telegram.bot.handleUpdate({
@@ -421,19 +543,130 @@ test("legacy sessionId bindings in lmk-state.jsonl start fresh without --convers
   assert.deepEqual(bridge.pollConversation("poll-1"), { chat_id: OWNER_CHAT, message_thread_id: 9 });
 });
 
-test("ready receipt missing conversationId fails startup, kills terminal, and cleans up prompt and ready files", async (t) => {
+test("originFp rebind edge case: replies to older messages in owned topics route to current/fresh session after fp rotation or /new, while remote originFp stays intact", async (t) => {
+  const { telegram, bridge, hc, lmkEvent, wait, waitReq } = setup(t, {
+    entries: [
+      { bind: { chat_id: OWNER_CHAT, message_thread_id: 9 }, fp: REMOTE_FP, scope: "owner", owned: false },
+      { chat: OWNER_CHAT, tg: 900, lmk: "remote-lmk-900", scope: "owner", fp: REMOTE_FP },
+    ],
+  });
+
+  // 1. Owned topic 50 spawns with fp1 and sends a message (Telegram message_id 50) -> recorded in msgByTg with fp1.
+  hc.nextFp = (_spec, n) => `owned_fp_${n}`;
+  await telegram.bot.handleUpdate({
+    update_id: 1,
+    message: { message_id: 501, date: 0, chat: chat(OWNER_CHAT), from: user(OWNER_USER), is_topic_message: true, message_thread_id: 50, text: "init" },
+  } as any);
+  await wait("owner-calls.jsonl", 1);
+  assert.equal(hc.spawns[0]!.fp, "owned_fp_1");
+
+  lmkEvent("owner", "agent-msg-1", "owned_fp_1", { content: "hello from owned_fp_1" });
+  await waitReq(1); // receives message_id 50
+
+  // 2. Reap and rotate fp to owned_fp_2 (e.g. after 7-day letmeknow retention expiry).
+  hc.reapable.add("t1");
+  await bridge.reapIdle(Date.now() + 2_000);
+  await telegram.bot.handleUpdate({
+    update_id: 2,
+    message: { message_id: 502, date: 0, chat: chat(OWNER_CHAT), from: user(OWNER_USER), is_topic_message: true, message_thread_id: 50, text: "wake rotated" },
+  } as any);
+  const callsAfterRotate = await wait("owner-calls.jsonl", 2);
+  assert.equal(hc.spawns[1]!.fp, "owned_fp_2");
+  assert.ok(callsAfterRotate[1].args.includes("owned_fp_2"));
+
+  // 3. Reply to the OLD message (message_id 50, whose msgByTg.fp is dead owned_fp_1) -> must route to owned_fp_2, NEVER owned_fp_1!
+  await telegram.bot.handleUpdate({
+    update_id: 3,
+    message: {
+      message_id: 503,
+      date: 0,
+      chat: chat(OWNER_CHAT),
+      from: user(OWNER_USER),
+      is_topic_message: true,
+      message_thread_id: 50,
+      reply_to_message: { message_id: 50, date: 0, chat: chat(OWNER_CHAT) },
+      text: "replying to old owned msg",
+    },
+  } as any);
+  const callsAfterOldReply = await wait("owner-calls.jsonl", 3);
+  assert.ok(callsAfterOldReply[2].args.includes("owned_fp_2"));
+  assert.equal(callsAfterOldReply[2].args.includes("owned_fp_1"), false);
+
+  // 4. /new codex unbinds topic 50 -> replying to old message_id 50 (dead owned_fp_1) launches fresh codex (owned_fp_3), NEVER dead owned_fp_1!
+  await telegram.bot.handleUpdate({
+    update_id: 4,
+    message: { message_id: 504, date: 0, chat: chat(OWNER_CHAT), from: user(OWNER_USER), is_topic_message: true, message_thread_id: 50, text: "/new codex", entities: [{ type: "bot_command", offset: 0, length: 4 }] },
+  } as any);
+  await telegram.bot.handleUpdate({
+    update_id: 5,
+    message: {
+      message_id: 505,
+      date: 0,
+      chat: chat(OWNER_CHAT),
+      from: user(OWNER_USER),
+      is_topic_message: true,
+      message_thread_id: 50,
+      reply_to_message: { message_id: 50, date: 0, chat: chat(OWNER_CHAT) },
+      text: "replying after /new",
+    },
+  } as any);
+  const callsAfterNewReply = await wait("owner-calls.jsonl", 4);
+  assert.equal(hc.spawns[2]!.spec.argv[0], "codex");
+  assert.ok(callsAfterNewReply[3].args.includes("owned_fp_3"));
+  assert.equal(callsAfterNewReply[3].args.includes("owned_fp_1"), false);
+
+  // 5. Replying to an unowned remote agent's message (tg 900, fp REMOTE_FP) inside topic 50 STILL routes to REMOTE_FP!
+  await telegram.bot.handleUpdate({
+    update_id: 6,
+    message: {
+      message_id: 506,
+      date: 0,
+      chat: chat(OWNER_CHAT),
+      from: user(OWNER_USER),
+      is_topic_message: true,
+      message_thread_id: 50,
+      reply_to_message: { message_id: 900, date: 0, chat: chat(OWNER_CHAT) },
+      text: "to remote agent",
+    },
+  } as any);
+  const callsAfterRemoteReply = await wait("owner-calls.jsonl", 5);
+  assert.ok(callsAfterRemoteReply[4].args.includes(REMOTE_FP));
+});
+
+test("expired savedFp receipt error retries once without --session while keeping harness and resumeId", async (t) => {
+  const { telegram, hc, wait } = setup(t, {
+    entries: [
+      { bind: { chat_id: OWNER_CHAT, message_thread_id: 61 }, fp: "expired_fp", scope: "owner", owned: true, harness: "pi", resumeId: "pi-uuid-61", hc: "dead-61" },
+    ],
+  });
+  hc.nextReceipt = (spec, n) => (n === 1 ? { error: "session expired" } : { fp: "fresh_fp_61", groups: [spec.join], warnings: [] });
+  await telegram.bot.handleUpdate({
+    update_id: 1,
+    message: { message_id: 810, date: 0, chat: chat(OWNER_CHAT), from: user(OWNER_USER), is_topic_message: true, message_thread_id: 61, text: "hello" },
+  } as any);
+  const calls = await wait("owner-calls.jsonl", 1);
+  assert.equal(hc.spawns.length, 2);
+  assert.equal(hc.spawns[0]!.spec.session, "expired_fp");
+  assert.equal(hc.spawns[1]!.spec.session, undefined);
+  assert.equal(hc.spawns[1]!.spec.argv[0], "pi");
+  assert.equal(hc.spawns[1]!.spec.argv[hc.spawns[1]!.spec.argv.indexOf("--session-id") + 1], "pi-uuid-61");
+  assert.deepEqual(hc.killed, ["t1"]);
+  assert.ok(calls[0].args.includes("fresh_fp_61"));
+});
+
+test("ready receipt missing fp fails startup, kills terminal, cleans up ready file, and keeps persistent prompt file", async (t) => {
   const { telegram, hc, waitReq, requests } = setup(t);
-  hc.nextReceipt = () => ({ fp: "bad1", groups: ["G_OWNER"] });
+  hc.nextReceipt = () => ({ groups: ["G_OWNER"] });
   await telegram.bot.handleUpdate({
     update_id: 1,
     message: { message_id: 801, date: 0, chat: chat(OWNER_CHAT), from: user(OWNER_USER), is_topic_message: true, message_thread_id: 66, text: "hi" },
   } as any);
   await waitReq(1);
   assert.equal(requests[0]![0], "sendMessage");
-  assert.match(requests[0]![1].text, /missing conversationId/);
+  assert.match(requests[0]![1].text, /missing fp/);
   assert.deepEqual(hc.killed, ["t1"]);
-  assert.equal(existsSync(hc.spawns[0]!.spec.env.AGY_LETMEKNOW_READY_FILE!), false);
-  assert.equal(existsSync(hc.spawns[0]!.spec.env.AGY_LETMEKNOW_PROMPT_FILE!), false);
+  assert.equal(existsSync(hc.spawns[0]!.spec.readyFile), false);
+  assert.equal(existsSync(hc.spawns[0]!.spec.env!.AGY_PROMPT_FILE!), true);
 });
 
 test("pending inbound item persisted in lmk-state.jsonl replays on bridge restart", async (t) => {

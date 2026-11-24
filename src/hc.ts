@@ -3,19 +3,27 @@ import { promisify } from "node:util";
 
 const exec = promisify(execFile);
 
+export type DeliverMode = "always" | "idle";
+
 export type HcTerminal = {
   address: string;
   state: "live" | "finished";
   parent?: string | null;
   status?: { state?: string; msg?: string } | null;
   labels?: Record<string, string>;
+  pid?: number;
+  created_ms?: number;
 };
 
 export type SpawnSpec = {
   name?: string;
   cwd: string;
   labels: Record<string, string>;
-  env: Record<string, string>;
+  join: string;
+  readyFile: string;
+  session?: string;
+  deliver?: DeliverMode;
+  env?: Record<string, string>;
   argv: string[];
 };
 
@@ -33,21 +41,36 @@ export function sanitizeTerminalName(raw: string): string {
 
 export class Hc implements HcClient {
   private readonly command: string;
+  private readonly hcLmk: string;
 
-  constructor(command = "hc") {
+  constructor(command = "hc", hcLmk = "hc-lmk") {
     this.command = command;
+    this.hcLmk = hcLmk;
   }
 
   async spawn(spec: SpawnSpec): Promise<string> {
-    const base = ["--bg", "--no-parent", "--outlive-parent", "--no-notify", "--cwd", spec.cwd, "--json"];
+    const base = [
+      "--bg",
+      "--json",
+      "--no-parent",
+      "--outlive-parent",
+      "--no-notify",
+      "--cwd", spec.cwd,
+      "--join", spec.join,
+      "--attach", "",
+      "--ready-file", spec.readyFile,
+      "--deliver", spec.deliver ?? "always",
+    ];
+    if (spec.session) base.push("--session", spec.session);
+    if (this.command !== "hc") base.push("--hc", this.command);
     for (const [k, v] of Object.entries(spec.labels)) base.push("--label", `${k}=${v}`);
-    const envPairs = Object.entries(spec.env).map(([k, v]) => `${k}=${v}`);
-    const tail = ["--", "env", ...envPairs, ...spec.argv];
+    const envPairs = Object.entries(spec.env ?? {}).map(([k, v]) => `${k}=${v}`);
+    const tail = envPairs.length ? ["--", "env", ...envPairs, ...spec.argv] : ["--", ...spec.argv];
     const runWith = async (name?: string): Promise<string> => {
-      const args = ["run", ...base, ...(name ? ["--name", sanitizeTerminalName(name)] : []), ...tail];
-      const { stdout } = await exec(this.command, args);
+      const args = [...base, ...(name ? ["--name", sanitizeTerminalName(name)] : []), ...tail];
+      const { stdout } = await exec(this.hcLmk, args);
       const parsed = JSON.parse(stdout) as { address?: string };
-      if (!parsed.address) throw new Error(`hc run did not return an address: ${stdout.trim()}`);
+      if (!parsed.address) throw new Error(`${this.hcLmk} did not return an address: ${stdout.trim()}`);
       return parsed.address;
     };
     try {

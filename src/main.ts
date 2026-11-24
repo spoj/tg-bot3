@@ -4,15 +4,20 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { Bridge, type EndpointConfig, type OwnerConfig } from "./bridge.ts";
-import { Hc } from "./hc.ts";
+import type { HarnessConfigMap } from "./harnesses.ts";
+import { Hc, type DeliverMode } from "./hc.ts";
 import { Telegram } from "./telegram.ts";
 import { Timeline, type Conversation } from "./timeline.ts";
 
 type Config = {
   token: string;
   cwd: string;
+  harness?: string;
+  harnesses?: HarnessConfigMap;
   agy?: string;
   hc?: string;
+  hcLmk?: string;
+  deliver?: DeliverMode;
   idleMs?: number;
   lmk: {
     letmeknow: string;
@@ -37,6 +42,10 @@ if (!config.lmk?.owner?.session || !config.lmk?.owner?.group) {
   console.error(`config.json must configure lmk.owner.{session, group, chat, user}`);
   process.exit(1);
 }
+if (config.deliver !== undefined && config.deliver !== "always" && config.deliver !== "idle") {
+  console.error(`config.json deliver must be "always" or "idle"`);
+  process.exit(1);
+}
 const cwd = expand(config.cwd);
 mkdirSync(state("attachments"), { recursive: true });
 
@@ -53,14 +62,14 @@ await new Promise<void>((resolve, reject) => {
 });
 
 const timeline = new Timeline(state("timeline.jsonl"));
-const hc = new Hc(config.hc ?? "hc");
+const hc = new Hc(config.hc ?? "hc", config.hcLmk ?? "hc-lmk");
 let bridge!: Bridge;
 const telegram = new Telegram({
   token: config.token,
   timeline,
   allowedPath: state("allowed.json"),
   attachmentsDir: state("attachments"),
-  onNew: (target) => bridge.resetConversation(target),
+  onNew: (target, harness) => bridge.resetConversation(target, harness),
   pollConversation: (id) => bridge.pollConversation(id),
 });
 bridge = new Bridge(
@@ -69,7 +78,10 @@ bridge = new Bridge(
     owner: config.lmk.owner,
     local: config.lmk.local,
     cwd,
-    agy: config.agy ?? "agy",
+    harness: config.harness,
+    harnesses: config.harnesses,
+    agy: config.agy,
+    deliver: config.deliver,
     botLabel: (path.basename(stateDir) === "bot" ? path.basename(path.dirname(stateDir)) : path.basename(stateDir)) || "default",
     idleMs: config.idleMs,
   },

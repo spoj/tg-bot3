@@ -7,7 +7,7 @@ Description=tg-bot3 Telegram gateway (%i)
 [Service]
 WorkingDirectory=%h/src/tg-bot3
 ExecStart=/usr/bin/env node src/main.ts %h/%i
-Environment=PATH=%h/.local/bin:%h/.bun/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=%h/.pi/agent/bin:%h/.local/bin:%h/.bun/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
 Restart=on-failure
 RestartSec=5s
 KillMode=mixed
