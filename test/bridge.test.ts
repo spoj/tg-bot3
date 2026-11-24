@@ -432,7 +432,7 @@ test("all 4 harness presets via /new <harness>, savedFp reuse on resume, discove
   const codexUuid = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
   env2.hc.onSpawn = (spec) => {
     if (spec.labels.harness === "codex" && spec.argv[1] !== "resume") {
-      const cfg = spec.argv[spec.argv.indexOf("-c") + 1]!;
+      const cfg = spec.argv.find((arg) => arg.startsWith("developer_instructions=")) ?? "";
       const m = cfg.match(/tg-bot3-run:[0-9a-f-]+/);
       if (m) {
         const d = new Date();

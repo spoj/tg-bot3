@@ -102,6 +102,7 @@ test("built-in presets build correct fresh and resume launch plans for agy, pi, 
     "--no-daemon",
     "--dangerously-bypass-approvals-and-sandbox",
     "--dangerously-bypass-hook-trust",
+    "-c", "check_for_update_on_startup=false",
     "-c", `developer_instructions=${tomlString(baseCtx.promptText)}`,
   ]);
 
@@ -114,6 +115,7 @@ test("built-in presets build correct fresh and resume launch plans for agy, pi, 
     "--no-daemon",
     "--dangerously-bypass-approvals-and-sandbox",
     "--dangerously-bypass-hook-trust",
+    "-c", "check_for_update_on_startup=false",
     "-c", `developer_instructions=${tomlString(baseCtx.promptText)}`,
     "01a1e824-d3dc-7281-9964-da9d356a08ac",
   ]);

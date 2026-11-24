@@ -144,6 +144,7 @@ const codexPreset: HarnessPreset = {
       "--no-daemon",
       "--dangerously-bypass-approvals-and-sandbox",
       "--dangerously-bypass-hook-trust",
+      "-c", "check_for_update_on_startup=false",
       "-c", `developer_instructions=${tomlString(ctx.promptText)}`,
       ...extraArgs,
     ];
